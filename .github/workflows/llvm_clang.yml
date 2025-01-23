@@ -221,7 +221,7 @@ jobs:
             "ref": "master",
             "inputs": {
               "sourceforge": "false",
-              "github_release": ${{ github.event.inputs.github_release }},
+              "github_release": "${{ github.event.inputs.github_release }}",
               "mpv_tarball": "false"
             }
           }
