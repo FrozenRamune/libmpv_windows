@@ -37,7 +37,7 @@ jobs:
     env:
       BIT: ${{ matrix.bit }}
     container:
-      image: docker://ghcr.io/FrozenRamune/archlinux:latest
+      image: docker://ghcr.io/shinchiro/archlinux:latest
     outputs:
       mpv_ver: ${{ steps.build_mpv_step.outputs.mpv_ver }}
     steps:
@@ -245,7 +245,7 @@ jobs:
         if: ${{ github.event.inputs.github_release == 'true' && github.event.inputs.mpv_tarball == 'false' }}
         continue-on-error: true
         run: |
-          id=$(curl -u FrozenRamune:$GH_TOKEN $CURL_RETRIES -s -X GET -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/FrozenRamune/libmpv_windows/releases/latest | jq -r '.id')
+          id=$(curl -u :$GH_TOKEN $CURL_RETRIES -s -X GET -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/FrozenRamune/libmpv_windows/releases/latest | jq -r '.id')
           for file in release/*.7z; do curl -u FrozenRamune:$GH_TOKEN $CURL_RETRIES -X POST -H "Accept: application/vnd.github.v3+json" -H "Content-Type: $(file -b --mime-type $file)" https://uploads.github.com/repos/FrozenRamune/libmpv_windows/releases/$id/assets?name=$(basename $file) --data-binary @$file; done
 
       - name: Pruning tags
