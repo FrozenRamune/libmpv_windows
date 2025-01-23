@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.19.0)
 project(mpv-cross C)
+
+option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
+
 include(ProcessorCount)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/download_externalproject.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/custom_steps.cmake)
