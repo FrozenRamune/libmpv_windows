@@ -6,6 +6,11 @@ defaults:
 on:
   workflow_dispatch:
     inputs:
+      github_release:
+        description: 'Upload to Github release'
+        required: false
+        default: false
+        type: boolean
       command:
         description: 'Run custom command before building'
         required: false
@@ -216,7 +221,7 @@ jobs:
             "ref": "master",
             "inputs": {
               "sourceforge": "false",
-              "github_release": "false",
+              "github_release": ${{ github.event.inputs.github_release }},
               "mpv_tarball": "false"
             }
           }
