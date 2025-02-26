@@ -1,0 +1,5319 @@
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 6f3f28d..0ee7dd8 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1,7 +1,8 @@
+ /*
+- * Dynamic Adaptive Streaming over HTTP demux
++ * Dynamic Adaptive Streaming over HTTP demuxer
+  * Copyright (c) 2017 samsamsam at o2.pl based on HLS demux
+  * Copyright (c) 2017 Steven Liu
++ * Copyright (c) 2021 reworked by zsugabubus
+  *
+  * This file is part of FFmpeg.
+  *
+@@ -19,182 +20,401 @@
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
++
++/**
++ * @file
++ * Dynamic Adaptive Streaming over HTTP demuxer
++ * @author samsamsam at o2.pl
++ * @author Steven Liu
++ * @author reworked by zsugabubus
++ * @see DASH-IF spec: https://dashif-documents.azurewebsites.net/DASH-IF-IOP/master/DASH-IF-IOP.html
++ * @see another spec: https://dashif-documents.azurewebsites.net/Guidelines-TimingModel/master/Guidelines-TimingModel.html
++ * @see test vectors: https://testassets.dashif.org/
++ * @see MPD scheme: https://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD.xsd
++ */
++
+ #include <libxml/parser.h>
++#include "libavutil/encryption_info.h"
+ #include "libavutil/intreadwrite.h"
++#include "libavutil/lfg.h"
++#include "libavutil/random_seed.h"
++#include "libavutil/avassert.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
+ #include "libavutil/parseutils.h"
+ #include "internal.h"
+ #include "avio_internal.h"
+-#include "dash.h"
++#include "libavutil/base64.h"
+
+-#define INITIAL_BUFFER_SIZE 32768
+-#define MAX_BPRINT_READ_SIZE (UINT_MAX - 1)
+-#define DEFAULT_MANIFEST_SIZE 8 * 1024
++#if CONFIG_HTTP_PROTOCOL
++# include "http.h"
++#endif
+
+-struct fragment {
+-    int64_t url_offset;
+-    int64_t size;
+-    char *url;
++#define MICROSEC_PER_SEC 1000000L
++#define MILLISEC_PER_SEC (MICROSEC_PER_SEC / 1000L)
++
++static const char CENC_NAMESPACE[] = "urn:mpeg:cenc:2013";
++
++enum {
++    /* Most init section <1K, but some DRM systems can use 600 or so bytes for
++     * PSSH data. */
++    INITBUF_MAX = 4 * 1024
+ };
+
+-/*
+- * reference to : ISO_IEC_23009-1-DASH-2012
+- * Section: 5.3.9.6.2
+- * Table: Table 17 — Semantics of SegmentTimeline element
+- * */
+-struct timeline {
+-    /* starttime: Element or Attribute Name
+-     * specifies the MPD start time, in @timescale units,
+-     * the first Segment in the series starts relative to the beginning of the Period.
+-     * The value of this attribute must be equal to or greater than the sum of the previous S
+-     * element earliest presentation time and the sum of the contiguous Segment durations.
+-     * If the value of the attribute is greater than what is expressed by the previous S element,
+-     * it expresses discontinuities in the timeline.
+-     * If not present then the value shall be assumed to be zero for the first S element
+-     * and for the subsequent S elements, the value shall be assumed to be the sum of
+-     * the previous S element's earliest presentation time and contiguous duration
+-     * (i.e. previous S at starttime + @duration * (@repeat + 1)).
+-     * */
+-    int64_t starttime;
+-    /* repeat: Element or Attribute Name
+-     * specifies the repeat count of the number of following contiguous Segments with
+-     * the same duration expressed by the value of @duration. This value is zero-based
+-     * (e.g. a value of three means four Segments in the contiguous series).
+-     * */
+-    int64_t repeat;
+-    /* duration: Element or Attribute Name
+-     * specifies the Segment duration, in units of the value of the @timescale.
+-     * */
++#define xml_for_each_attr /* { ... } */ \
++    for (xmlAttrPtr attr = node->properties; \
++         attr; \
++         attr = attr->next) \
++        for (xmlChar *value = xmlNodeGetContent(attr->children); \
++             value; \
++             xml_freep(&value))
++
++#define xml_for_each_child /* { ... } */ \
++    for (xmlNodePtr child = xmlFirstElementChild(node); \
++         child; \
++         child = xmlNextElementSibling(child))
++
++#define ARRAY_SIZE(x) (sizeof(x) / sizeof(*x))
++
++#define DASH_RANGE_INITALIZER (DASHRange){ .start = 0, .end = INT64_MAX }
++
++typedef struct {
++    int64_t start;
++    int64_t end;
++} DASHRange;
++
++typedef struct {
++    xmlChar *url;
++    DASHRange range;
++} DASHSegment;
++
++typedef struct {
++    xmlChar *id;
++    int64_t start_ts;
++    int64_t end_ts;
++    AVDictionary *metadata;
++} DASHPeriod;
++
++typedef struct {
++    int64_t start_ts; /* Relative to timeline. */
++    uint64_t number; /**< $Number$ */
++    int64_t repeat; /**< number..=(number + repeat) */
+     int64_t duration;
++} DASHSegmentTemplate;
++
++typedef struct {
++    unsigned refcount;
++    unsigned nb;
++    char *elems[];
++} DASHURLList;
++
++typedef struct {
++    AVIOContext *pb; /**< IO context for reading segment. */
++    uint64_t segment_size; /**< Size of segment to read. */
++} DASHSegmentContext;
++
++typedef struct {
++    xmlChar *id;
++
++    unsigned refcount;
++    AVDictionary *metadata;
++    AVEncryptionInitInfo *init_info; /**< Chain of initialization infos
++                                       extracted from the manifest. */
++} DASHAdaptationSet;
++
++enum DASHTimelineType {
++    TIMELINE_TEMPLATES, /**< DASHTimeline.u.templates */
++    TIMELINE_SEGMENTS, /**< DASHTimeline.u.segments */
+ };
+
+-/*
+- * Each playlist has its own demuxer. If it is currently active,
+- * it has an opened AVIOContext too, and potentially an AVPacket
+- * containing the next packet from this stream.
+- */
+-struct representation {
+-    char *url_template;
+-    AVIOContext pb;
+-    AVIOContext *input;
+-    AVFormatContext *parent;
+-    AVFormatContext *ctx;
+-    int stream_index;
+-
+-    char *id;
+-    char *lang;
+-    int bandwidth;
+-    AVRational framerate;
+-    AVStream *assoc_stream; /* demuxer stream associated with this representation */
+-
+-    int n_fragments;
+-    struct fragment **fragments; /* VOD list of fragment for profile */
+-
+-    int n_timelines;
+-    struct timeline **timelines;
+-
+-    int64_t first_seq_no;
+-    int64_t last_seq_no;
+-    int64_t start_number; /* used in case when we have dynamic list of segment to know which segments are new one*/
+-
+-    int64_t fragment_duration;
+-    int64_t fragment_timescale;
+-
+-    int64_t presentation_timeoffset;
+-
+-    int64_t cur_seq_no;
+-    int64_t cur_seg_offset;
+-    int64_t cur_seg_size;
+-    struct fragment *cur_seg;
+-
+-    /* Currently active Media Initialization Section */
+-    struct fragment *init_section;
+-    uint8_t *init_sec_buf;
+-    uint32_t init_sec_buf_size;
+-    uint32_t init_sec_data_len;
+-    uint32_t init_sec_buf_read_offset;
+-    int64_t cur_timestamp;
+-    int is_restart_needed;
++typedef struct {
++    unsigned refcount;
++    enum DASHTimelineType type;
++    int64_t duration;
++    int64_t timescale;
++    DASHSegment init;
++    union {
++        struct {
++            unsigned nb;
++            DASHSegment elems[];
++        } segments;
++        struct {
++            unsigned nb;
++            DASHSegment master;
++            DASHSegmentTemplate elems[];
++        } templates;
++    } u;
++} DASHTimeline;
++
++#define DASH_PARAMETERS_INITIALIZER { \
++    .sample_aspect_ratio = { 0, 1 }, \
++    .field_order = AV_FIELD_PROGRESSIVE, \
++}
++
++typedef struct {
++    enum AVMediaType codec_type;
++    enum AVCodecID codec_id;
++    int profile;
++    int level;
++    int disposition;
++
++    /* Audio only. */
++    int sample_rate;
++    int channels;
++    uint64_t channel_layout;
++    enum AVMatrixEncoding matrix_encoding;
++
++    /* Video only. */
++    int width;
++    int height;
++    AVRational frame_rate;
++    AVRational sample_aspect_ratio;
++    enum AVFieldOrder field_order;
++} DASHParameters;
++
++typedef struct {
++    DASHPeriod *period;
++    DASHAdaptationSet *as;
++    DASHTimeline *timeline;
++    DASHURLList *base;
++    uint32_t bandwidth;
++
++    char *initbuf;
++    int initbuf_size; /* Limited by INITBUF_MAX. */
++
++    DASHParameters par;
++} DASHRepresentationPeriod;
++
++typedef struct {
++    xmlChar *id;
++
++    AVFormatContext *oc; /* := DASHContext.ctx */
++    AVStream **ostreams; /**< Corresponding output streams. */
++    AVFormatContext *ic;
++    unsigned nb_streams; /**< Should be := ic->nb_streams. If less, subdemuxer
++                           created new streams. */
++
++    AVIOContext ic_pb; /**< Custom IO context for ic subdemuxer. */
++
++    int save_init; /**< Whether to store what we have read from the current segment. */
++    DASHRepresentationPeriod **periods;
++    unsigned nb_periods;
++    DASHRepresentationPeriod *cur_period;
++
++    int64_t last_pts;
++    int64_t read_ts;
++
++    unsigned cur_segment;
++    DASHSegmentContext segments[];
++} DASHRepresentation;
++
++enum DASHUTCTiming {
++    DASH_UTC_TIMING_LOCAL,
++    DASH_UTC_TIMING_HTTP_XSDATE,
++    DASH_UTC_TIMING_HTTP_ISO,
++    DASH_UTC_TIMING_HTTP_NTP,
++    DASH_UTC_TIMING_NTP,
++    DASH_UTC_TIMING_HTTP_HEAD,
++    DASH_UTC_TIMING_DIRECT,
+ };
+
+-typedef struct DASHContext {
++typedef struct {
+     const AVClass *class;
+-    char *base_url;
+-
+-    int n_videos;
+-    struct representation **videos;
+-    int n_audios;
+-    struct representation **audios;
+-    int n_subtitles;
+-    struct representation **subtitles;
+-
+-    /* MediaPresentationDescription Attribute */
+-    uint64_t media_presentation_duration;
+-    uint64_t suggested_presentation_delay;
+-    uint64_t availability_start_time;
+-    uint64_t availability_end_time;
+-    uint64_t publish_time;
+-    uint64_t minimum_update_period;
+-    uint64_t time_shift_buffer_depth;
+-    uint64_t min_buffer_time;
+-
+-    /* Period Attribute */
+-    uint64_t period_duration;
+-    uint64_t period_start;
+-
+-    /* AdaptationSet Attribute */
+-    char *adaptionset_lang;
+-
+-    int is_live;
+-    AVIOInterruptCB *interrupt_callback;
+-    char *allowed_extensions;
+-    AVDictionary *avio_opts;
+-    int max_url_size;
+-
+-    /* Flags for init section*/
+-    int is_init_section_common_video;
+-    int is_init_section_common_audio;
+-    int is_init_section_common_subtitle;
+
++    xmlChar *id;
++
++    char *location;
++    xmlChar *chain_next_location;
++    xmlChar *fallback_location;
++
++    unsigned nb_connections;
++
++    DASHPeriod **periods;
++    unsigned nb_periods;
++
++    DASHAdaptationSet **ass;
++    unsigned nb_ass;
++
++    DASHRepresentation **reps;
++    unsigned nb_reps;
++
++    int is_live; /**< Segments may get available over time. */
++    int64_t start_ts;
++
++    int64_t media_presentation_duration;
++    int64_t suggested_presentation_delay;
++    int64_t availability_start_time;
++    int64_t availability_end_time;
++    int64_t publish_time;
++    int64_t min_update_period;
++    int64_t time_shift_buffer_depth;
++    int64_t min_buffer_time;
++    int64_t max_segment_duration;
++
++    int64_t next_update;
++
++    int64_t time_diff;
++    int utc_timing; /* DASH_UTC_TIMING_*; < 0 if updated */
++
++    AVLFG rnd;
++
++    AVDictionary *protocol_opts;
+ } DASHContext;
+
+-static int ishttp(char *url)
++typedef struct {
++    xmlChar *scheme_id;
++    xmlChar *value;
++    xmlAttrPtr scheme_id_attr;
++} DASHScheme;
++
++#define DASH_CONTENTPROTECTION_INITIALIZER { .has_key_id = 0 }
++
++typedef struct {
++    int has_key_id;
++    uint8_t default_kid[16];
++} DASHContentProtection;
++
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wstrict-prototypes"
++static av_cold void av_freep_arrayp(void *ptr, void (*free)())
++{
++    unsigned *nmemb = (unsigned *)((void **)ptr + 1);
++
++    for (unsigned i = 0; i < *nmemb; ++i)
++        ((void(*)(void *))free)((*(void ***)ptr)[i]);
++
++    *nmemb = 0;
++    av_freep(ptr);
++}
++#pragma GCC diagnostic pop
++
++static void xml_free(xmlChar *p)
++{
++    if (p)
++        xmlFree(p);
++}
++
++static void xml_freep(xmlChar **pp)
++{
++    if (*pp) {
++        xmlFree(*pp);
++        *pp = NULL;
++    }
++}
++
++static av_cold DASHURLList *dash_ref_urllist(DASHURLList *urls)
++{
++    ++urls->refcount;
++    return urls;
++}
++
++static av_cold void dash_unref_urllist(DASHURLList *urls)
++{
++    if (!urls || --urls->refcount)
++        return;
++
++    for (unsigned i = 0; i < urls->nb; ++i)
++        av_free(urls->elems[i]);
++    av_free(urls);
++}
++
++static int dash_urllist_has(const DASHURLList *urls, const char *url)
+ {
+-    const char *proto_name = avio_find_protocol_name(url);
+-    return proto_name && av_strstart(proto_name, "http", NULL);
++    for (unsigned i = 0; i < urls->nb; ++i)
++        if (!strcmp(urls->elems[i], url))
++            return 1;
++
++    return 0;
++}
++
++static av_cold void dash_free_period(DASHPeriod *period)
++{
++    if (!period)
++        return;
++
++    xml_free(period->id);
++    av_dict_free(&period->metadata);
++    av_free(period);
++}
++
++static av_cold void dash_free_adaptationset(DASHAdaptationSet *as)
++{
++    if (!as)
++        return;
++
++    xml_free(as->id);
++    av_encryption_init_info_free(as->init_info);
++    av_dict_free(&as->metadata);
++    av_free(as);
++}
++
++static av_cold DASHTimeline *dash_ref_timeline(DASHTimeline *timeline)
++{
++    ++timeline->refcount;
++    return timeline;
++}
++
++static void dash_free_segment(DASHSegment *g)
++{
++    xml_free(g->url);
++}
++
++static void dash_unref_timeline(DASHTimeline *timeline)
++{
++    if (!timeline || --timeline->refcount)
++        return;
++
++    dash_free_segment(&timeline->init);
++
++    if (TIMELINE_SEGMENTS == timeline->type) {
++        for (unsigned i = 0; i < timeline->u.segments.nb; ++i)
++            dash_free_segment(&timeline->u.segments.elems[i]);
++    } else if (TIMELINE_TEMPLATES == timeline->type) {
++        dash_free_segment(&timeline->u.templates.master);
++    } else {
++        abort();
++    }
++
++    av_free(timeline);
+ }
+
+-static int aligned(int val)
++/**
++ * @return |wall_time| / MICROSEC_PER_SEC * AV_TIME_BASE
++ */
++static int64_t av_wall2timebase(int64_t wall_time)
+ {
+-    return ((val + 0x3F) >> 6) << 6;
++    if (MICROSEC_PER_SEC < AV_TIME_BASE)
++        return wall_time * (AV_TIME_BASE / MICROSEC_PER_SEC);
++    else
++        return wall_time / (MICROSEC_PER_SEC / AV_TIME_BASE);
+ }
+
+-static uint64_t get_current_time_in_sec(void)
++/**
++ * @return wall clock time in AV_TIME_BASE
++ */
++static int64_t dash_gettime(AVFormatContext *s)
+ {
+-    return  av_gettime() / 1000000;
++    DASHContext *c = s->priv_data;
++    return av_wall2timebase(av_gettime()) + c->time_diff;
+ }
+
+-static uint64_t get_utc_date_time_insec(AVFormatContext *s, const char *datetime)
++/**
++ * Parse ISO-8601 date.
++ * @return time in AV_TIME_BASE
++ */
++static uint64_t dash_parse_date(const char *s, AVFormatContext *log_ctx)
+ {
+     struct tm timeinfo;
+-    int year = 0;
+-    int month = 0;
+-    int day = 0;
+-    int hour = 0;
+-    int minute = 0;
+-    int ret = 0;
++    unsigned year = 0, month = 0, day = 0;
++    unsigned hour = 0, minute = 0;
+     float second = 0.0;
+
+-    /* ISO-8601 date parser */
+-    if (!datetime)
+-        return 0;
++    if (6 != av_sscanf(s, "%u-%u-%uT%u:%u:%fZ",
++                       &year, &month, &day,
++                       &hour, &minute, &second))
++        av_log(log_ctx, AV_LOG_WARNING, "Malformed ISO-8601 date: '%s'\n", s);
++        /* Fall-through. */
+
+-    ret = sscanf(datetime, "%d-%d-%dT%d:%d:%fZ", &year, &month, &day, &hour, &minute, &second);
+-    /* year, month, day, hour, minute, second  6 arguments */
+-    if (ret != 6) {
+-        av_log(s, AV_LOG_WARNING, "get_utc_date_time_insec get a wrong time format\n");
+-    }
+     timeinfo.tm_year = year - 1900;
+     timeinfo.tm_mon  = month - 1;
+     timeinfo.tm_mday = day;
+@@ -205,2189 +425,2711 @@ static uint64_t get_utc_date_time_insec(AVFormatContext *s, const char *datetime
+     return av_timegm(&timeinfo);
+ }
+
+-static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
+-{
+-    /* ISO-8601 duration parser */
+-    uint32_t days = 0;
+-    uint32_t hours = 0;
+-    uint32_t mins = 0;
+-    uint32_t secs = 0;
+-    int size = 0;
+-    float value = 0;
+-    char type = '\0';
+-    const char *ptr = duration;
+-
+-    while (*ptr) {
+-        if (*ptr == 'P' || *ptr == 'T') {
+-            ptr++;
++/**
++ * Parse ISO-8601 duration.
++ * @return duration in AV_TIME_BASE
++ */
++static int64_t dash_parse_duration(const char *s, AVFormatContext *log_ctx)
++{
++    enum {
++        STATE_GROUND,
++        STATE_DATE,
++        STATE_TIME,
++    } state = STATE_GROUND;
++    int64_t ret = 0;
++
++    for (const char *p = s; *p; ++p) {
++        int len;
++        int64_t unit = 0;
++        /* We require double precision since it is absolutely valid to pass a
++         * huge integer solely in seconds. */
++        double base;
++
++        switch (*p) {
++        case 'P':
++            if (state != STATE_GROUND)
++                goto invalid;
++            state = STATE_DATE;
++            continue;
++        case 'T':
++            if (state != STATE_DATE)
++                goto invalid;
++            state = STATE_TIME;
+             continue;
+         }
+
+-        if (sscanf(ptr, "%f%c%n", &value, &type, &size) != 2) {
+-            av_log(s, AV_LOG_WARNING, "get_duration_insec get a wrong time format\n");
+-            return 0; /* parser error */
++        av_sscanf(p, "%lf%n", &base, &len);
++        p += len;
++
++        switch (state) {
++        case STATE_DATE:
++            switch (*p) {
++            case 'Y':
++                unit = (int64_t)AV_TIME_BASE * 60 * 60 * 24 * 365;
++                break;
++            case 'M':
++                unit = (int64_t)AV_TIME_BASE * 60 * 60 * 24 * 30;
++                break;
++            case 'D':
++                unit = (int64_t)AV_TIME_BASE * 60 * 60 * 24;
++                break;
++            }
++            break;
++        case STATE_TIME:
++            switch (*p) {
++            case 'H':
++                unit = (int64_t)AV_TIME_BASE * 60 * 60;
++                break;
++            case 'M':
++                unit = (int64_t)AV_TIME_BASE * 60;
++                break;
++            case 'S':
++                unit = (int64_t)AV_TIME_BASE;
++                break;
++            }
++            break;
++        }
++
++        if (!unit) {
++        invalid:
++            av_log(log_ctx, AV_LOG_ERROR, "Malformed ISO-8601 duration: '%s'\n", s);
++            return INT64_MIN;
+         }
++
++        ret += unit * base;
++    }
++
++    return ret;
++}
++
++static av_cold void dash_subdemuxer_flush(DASHRepresentation *rep)
++{
++    DASHContext *c = rep->oc->priv_data;
++
++    avio_flush(&rep->ic_pb);
++    for (unsigned i = 0; i < c->nb_connections; ++i)
++        ff_format_io_close(rep->oc, &rep->segments[i].pb);
++
++
++    /* for (unsigned i = 0; i < rep->nb_streams; ++i)
++            avcodec_flush_buffers(rep->ostreams[i]->internal->avctx); */
++
++    if (rep->ic) {
++        /* for (unsigned i = 0; i < rep->ic->nb_streams; ++i)
++                avcodec_flush_buffers(rep->ic->streams[i]->internal->avctx); */
++        avformat_flush(rep->ic);
++    }
++
++    /* If receiving init section just has been aborted, we have to forget all
++     * received bytes otherwise at subdemuxer restart on the first read it will
++     * be falsely detected that we have received the complete section because
++     * stored init section size is less than maximum storable. */
++    if (rep->save_init) {
++        rep->save_init = 0;
++        if (rep->cur_period) {
++            rep->cur_period->initbuf_size = 0;
++            rep->cur_period = NULL;
++        }
++    }
++}
++
++static av_cold void dash_subdemuxer_close(DASHRepresentation *rep)
++{
++    av_log(rep->oc, AV_LOG_DEBUG, "Closing representation '%s'\n", rep->id);
++
++    /* Only need to deallocate the used array. */
++    av_freep(&rep->ic_pb.buffer);
++
++    dash_subdemuxer_flush(rep);
++
++    if (rep->ic) {
++        /* IO context is part of our context so avoid freeing it. */
++        rep->ic->pb = NULL;
++        rep->cur_period = NULL;
++
++        if (rep->ic->iformat) {
++            avformat_close_input(&rep->ic);
++        } else {
++            avformat_free_context(rep->ic);
++            rep->ic = NULL;
++        }
++    }
++}
++
++static av_cold void dash_free_representationperiod(DASHRepresentationPeriod *period)
++{
++    dash_unref_timeline(period->timeline);
++    dash_unref_urllist(period->base);
++    av_free(period->initbuf);
++    av_free(period);
++}
++
++static av_cold void dash_free_representation(DASHRepresentation *rep)
++{
++    dash_subdemuxer_close(rep);
++    av_free(rep->ostreams);
++    av_freep_arrayp(&rep->periods, dash_free_representationperiod);
++    xml_free(rep->id);
++    av_free(rep);
++}
++
++static av_cold xmlNodePtr xml_get_nsnode(xmlNodePtr node, const char *nodename, const char *namespace)
++{
++    xml_for_each_child
++        if (!strcmp(child->name, nodename) &&
++            (child->ns && !strcmp(child->ns->href, namespace)))
++            return child;
++    return NULL;
++}
++
++static av_cold int dash_parse_contentprotection_pssh(AVFormatContext *s,
++                                                     struct AVEncryptionInitInfo *info,
++                                                     xmlNodePtr node)
++{
++    int ret = 0;
++    xmlNodePtr pssh_node;
++    int size;
++    char *pssh = NULL;
++    int decoded_size;
++    uint8_t *decoded_pssh;
++
++    av_free(info->data);
++    info->data = NULL;
++    info->data_size = 0;
++
++    if (!(pssh_node = xml_get_nsnode(node, "pssh", CENC_NAMESPACE)))
++        goto out;
++
++    if (!(pssh = xmlNodeGetContent(pssh_node)))
++        goto invalid_content;
++
++    size = strlen(pssh);
++    decoded_size = AV_BASE64_DECODE_SIZE(size);
++
++    if (!(decoded_pssh = av_malloc(decoded_size))) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++
++    if ((decoded_size = av_base64_decode(decoded_pssh, pssh, decoded_size)) < 0) {
++        av_free(decoded_pssh);
++
++    invalid_content:
++        av_log(s, AV_LOG_ERROR, "Invalid %s/{%s}:pssh content\n",
++               node->name, CENC_NAMESPACE);
++        ret = AVERROR_INVALIDDATA;
++        goto out;
++    }
++
++    info->data = decoded_pssh;
++    info->data_size = decoded_size;
++
++out:
++    xml_free(pssh);
++    return ret;
++}
++
++static av_cold void dash_free_scheme(DASHScheme *scheme)
++{
++    xml_free(scheme->scheme_id);
++    xml_free(scheme->value);
++}
++
++static av_cold void dash_log_invalid_attr_value(AVFormatContext *log_ctx, xmlAttrPtr attr, const char *value)
++{
++    av_log(log_ctx, AV_LOG_ERROR, "Invalid %s/%s@%s%s%s%s='%s'\n",
++           attr->parent->parent->name,
++           attr->parent->ns ? "{" : "",
++           attr->parent->ns ? (const char *)attr->parent->ns->href : "",
++           attr->parent->ns ? "}" : "",
++           attr->parent->name,
++           attr->name,
++           value);
++}
++
++static av_cold void dash_log_missing_attr(AVFormatContext *log_ctx, xmlNodePtr node, const char *attr)
++{
++    av_log(log_ctx, AV_LOG_ERROR, "Missing %s/%s@%s\n",
++           node->parent->name,
++           node->name,
++           attr);
++}
++
++static av_cold void dash_log_unknown_child(AVFormatContext *log_ctx, xmlNodePtr child)
++{
++    av_log(log_ctx, AV_LOG_WARNING, "Unknown %s/%s\n",
++           child->parent->name,
++           child->name);
++}
++
++static av_cold void dash_log_unknown_attr(AVFormatContext *log_ctx, xmlAttrPtr attr, const xmlChar *value)
++{
++    av_log(log_ctx, AV_LOG_WARNING, "Unknown %s%s%s@%s%s%s%s='%s'\n",
++           attr->parent->parent->name ? (const char *)attr->parent->parent->name : "",
++           attr->parent->parent->name ? "/"                                      : "",
++           attr->parent->name,
++           attr->ns ? "{" : "",
++           attr->ns ? (const char *)attr->ns->href : "",
++           attr->ns ? "}:" : "",
++           attr->name,
++           value);
++}
++
++static av_cold void dash_log_unknown_scheme(AVFormatContext *log_ctx, const DASHScheme *scheme)
++{
++    av_log(log_ctx, AV_LOG_WARNING,
++           "Unknown %s/%s@%s='%s' (@value=%c%s%c)\n",
++           scheme->scheme_id_attr->parent->parent->name,
++           scheme->scheme_id_attr->parent->name,
++           scheme->scheme_id_attr->name,
++           scheme->scheme_id,
++           scheme->value ? '\''                        : '(',
++           scheme->value ? (const char *)scheme->value : "not present",
++           scheme->value ? '\''                        : ')');
++}
++
++static av_cold int dash_parse_scheme(AVFormatContext *s, DASHScheme *scheme, int value_required, xmlNodePtr node)
++{
++    scheme->value = NULL;
++
++    if (!(scheme->scheme_id_attr = xmlHasNsProp(node, "schemeIdUri", NULL))) {
++        dash_log_missing_attr(s, node, "schemeIdUri");
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (!(scheme->scheme_id = xmlNodeGetContent(scheme->scheme_id_attr->children)))
++        return AVERROR(ENOMEM);
++
++    if (!(scheme->value = xmlGetNoNsProp(node, "value")) && value_required) {
++        dash_log_missing_attr(s, node, "value");
++        return AVERROR_INVALIDDATA;
++    }
++
++    return 0;
++}
++
++static av_cold int dash_parse_contentprotection(AVFormatContext *s,
++                                                DASHAdaptationSet *as,
++                                                DASHContentProtection *cp,
++                                                xmlNodePtr node)
++{
++    int ret = 0;
++    AVEncryptionInitInfo *init_info = NULL;
++    const char *uuid;
++    DASHScheme scheme;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 0, node)) < 0)
++        goto out;
++
++    /* Parse Common Encryption element. */
++    if (!cp->has_key_id &&
++        !strcmp(scheme.scheme_id, "urn:mpeg:dash:mp4protection:2011") &&
++        (scheme.value && !strcmp(scheme.value, "cenc")))
++    {
++        char *key_id;
++
++        if ((key_id = xmlGetNsProp(node, "default_KID", CENC_NAMESPACE))) {
++            if (ff_uuid_to_data(cp->default_kid, key_id) < 0)
++                av_log(s, AV_LOG_ERROR, "Malformed UUID in ContentProtection at cenc:default_KID='%s'\n",
++                       scheme.scheme_id);
++            else
++                cp->has_key_id = 1;
++
++            xmlFree(key_id);
++        } else {
++            dash_log_missing_attr(s, node, "default_KID");
++        }
++
++        goto out;
++    } else if (cp->has_key_id && av_strstart(scheme.scheme_id, "urn:uuid:", &uuid)) {
++        /* Parse an UUID schema. */
++        init_info = av_encryption_init_info_alloc(/* system_id_size */ 16, 1,
++                                                  /* key_id_size */ 16, /* data_size */ 0,
++                                                  /* extra_data_size */ 0);
+ zsugabubus,
+
+is line will break the compling work.
+
+ libavformat/dashdec.o
+c/libavformat/dashdec.c:748:73: error: too many arguments to
+nction call, expected 4, have 5
+                                                /* extra_data_size */ 0);
+                                                                      ^
+c/libavutil/encryption_info.h:176:1: note:
+v_encryption_init_info_alloc' declared here
+EncryptionInitInfo *av_encryption_init_info_alloc(
+
+c/libavformat/dashdec.c:1777:86: warning: incompatible pointer types
+ssing 'int *' to parameter of type 'size_t *'
+    (aka 'unsigned long *') [-Wincompatible-pointer-types]
+          side_data =
+_encryption_init_info_add_side_data(period->as->init_info,
+ide_data_size);
+
+            ^~~~~~~~~~~~~~~
+c/libavutil/encryption_info.h:203:47: note: passing argument to
+rameter 'side_data_size' here
+  const AVEncryptionInitInfo *info, size_t *side_data_size);
+                                            ^
+warning and 1 error generated.
+ke: *** [libavformat/dashdec.o] Error 1
+
+
+
+
++        if (!init_info) {
++            ret = AVERROR(ENOMEM);
++            goto out;
++        }
++
++        if (ff_uuid_to_data(init_info->system_id, uuid) < 0) {
++            av_log(s, AV_LOG_ERROR, "Malformed UUID in ContentProtection at schemeIdUri='%s'\n",
++                   scheme.scheme_id);
++            goto out;
++        }
++
++        if (0 <= ret)
++            ret = dash_parse_contentprotection_pssh(s, init_info, node);
++        if (ret < 0)
++            goto out;
++
++        memcpy(init_info->key_ids[0], cp->default_kid, init_info->key_id_size);
++
++        init_info->next = as->init_info;
++        as->init_info = init_info;
++        init_info = NULL;
++    } else {
++        dash_log_unknown_scheme(s, &scheme);
++        goto out;
++    }
++
++out:
++    if (init_info)
++        av_encryption_init_info_free(init_info);
++    dash_free_scheme(&scheme);
++
++    return ret;
++}
++
++static av_cold int dash_set_location(AVFormatContext *s, char const *url)
++{
++    DASHContext *c = s->priv_data;
++    URLComponents uc;
++    char const *protocol;
++
++    if (ff_url_decompose(&uc, url, NULL) < 0)
++        return AVERROR_INVALIDDATA;
++
++    av_free(c->location);
++    if (!(c->location = av_strdup(url)))
++        return AVERROR(ENOMEM);
++
++    protocol = avio_find_protocol_name(c->location);
++    if (strstr(protocol, "http")) {
++        char *p = strstr(uc.query, "t=");
++        if (p) {
++            int64_t seconds;
++
++            p += 2;
++            if (1 == av_sscanf(p, "posix:%"SCNd64, &seconds))
++                c->start_ts = AV_TIME_BASE * seconds;
++            else if (!strncmp(p, "now", 4))
++                c->start_ts = dash_gettime(s);
++            else
++                c->start_ts = dash_parse_date(p, s);
++        }
++    }
++
++    return 0;
++}
++
++static av_cold int dash_parse_location(AVFormatContext *s,
++                                       xmlNodePtr node)
++{
++    int ret = 0;
++    char *value;
++    DASHContext *c = s->priv_data;
++
++    if (!c->is_live) {
++        av_log(s, AV_LOG_INFO, "MPD at type=\"static\"/Location ignored\n");
++        return 0;
++    }
++
++    if (!(value = xmlNodeGetContent(node)))
++        return AVERROR(ENOMEM);
++
++    ret = dash_set_location(s, value);
++
++    xmlFree(value);
++    return ret;
++}
++
++/**
++ * Like ff_make_absolute_urla() but allocates a big enough memory.
++ * *out_url shall always be av_free()d regard of error.
++ * */
++static int ff_make_absolute_urla(char **out_url, const char *base, const char *rel)
++{
++    int out_url_max_size = strlen(base) + strlen(rel) + 1/* NUL */;
++    if (!(*out_url = av_malloc(out_url_max_size)))
++        return AVERROR(ENOMEM);
++
++    return ff_make_absolute_url(*out_url, out_url_max_size, base, rel);
++}
++
++static av_cold DASHURLList *dash_new_urllist(unsigned nb_urls)
++{
++    DASHURLList *urls;
++
++    if (!(urls = av_mallocz(offsetof(DASHURLList, elems[nb_urls]))))
++        return NULL;
++
++    dash_ref_urllist(urls);
++    urls->nb = nb_urls;
++
++    return urls;
++}
++
++static av_cold int dash_parse_baseurl(AVFormatContext *s,
++                                      DASHURLList **urls,
++                                      xmlNodePtr node)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    char *url_chunk = NULL;
++    char *resolved_url = NULL;
++    DASHURLList *new_urls = NULL;
++    int is_absolute;
++    char *base_url;
++
++    if (!(url_chunk = xmlNodeGetContent(node)))
++        return AVERROR(ENOMEM);
++
++    base_url = (*urls)->elems[0];
++    if ((ret = ff_make_absolute_urla(&resolved_url, base_url, url_chunk)) < 0)
++        goto out;
++
++    if (dash_urllist_has(*urls, resolved_url))
++        goto out;
++
++    is_absolute = !strcmp(resolved_url, url_chunk);
++
++    if (1 == (*urls)->refcount) {
++        /* If we own the instance, it means that this node is an alternative
++         * BaseURL. */
++        if (is_absolute) {
++            void *p;
++
++            if ((p = av_realloc(*urls, offsetof(DASHURLList, elems[(*urls)->nb + 1])))) {
++                /* Put the new URL at a random place. Absolute addresses most
++                 * commonly mean different servers/CDNs, so we can help a
++                 * little bit on load-balancing. */
++                unsigned to_index;
++
++                *urls = p;
++                to_index = av_lfg_get(&c->rnd) % ((*urls)->nb + 1);
++                (*urls)->elems[(*urls)->nb++] = (*urls)->elems[to_index];
++                (*urls)->elems[to_index] = resolved_url, resolved_url = NULL;
++            }
++        } else {
++            /* We do not want to explode URL list so we ignore relative
++             * alternative URLs. Also, using different paths on the same
++             * server does not really makes sense. */
++        }
++    } else {
++        /* Either add a single absolute URL to the list or in case of a
++         * relative BaseURL combine it with every parent URL. */
++        if (!(new_urls = dash_new_urllist(is_absolute ? 1 : (*urls)->nb))) {
++            ret = AVERROR(ENOMEM);
++            goto out;
++        }
++
++        /* We have already done the first one at the top. */
++        new_urls->elems[0] = resolved_url, resolved_url = NULL;
++        if (!is_absolute) {
++            for (unsigned i = 1; i < (*urls)->nb; ++i)
++                if (!(ret = ff_make_absolute_urla(&new_urls->elems[i], (*urls)->elems[i], url_chunk)))
++                    goto out;
++        }
++
++        /* Replace URL list of current level with the modified one. */
++        dash_unref_urllist(*urls);
++        *urls = new_urls;
++        new_urls = NULL;
++    }
++
++out:
++    xmlFree(url_chunk);
++    av_free(resolved_url);
++    dash_unref_urllist(new_urls);
++    return ret;
++}
++
++static av_cold int dash_parse_mimetype(DASHParameters *par, const char *value)
++{
++    if (!strncmp(value, "video/", 6))
++        par->codec_type = AVMEDIA_TYPE_VIDEO;
++    else if (!strncmp(value, "audio/", 6))
++        par->codec_type = AVMEDIA_TYPE_AUDIO;
++    else if (!strncmp(value, "text/", 5))
++        par->codec_type = AVMEDIA_TYPE_SUBTITLE;
++    else
++        return 1;
++
++    return 0;
++}
++
++static av_cold int dash_parse_contenttype(AVFormatContext *s,
++                                          DASHParameters *par,
++                                          const xmlChar *value)
++{
++    if (!strcmp(value, "video"))
++        par->codec_type = AVMEDIA_TYPE_VIDEO;
++    else if (!strcmp(value, "audio"))
++        par->codec_type = AVMEDIA_TYPE_AUDIO;
++    else {
++        par->codec_type = AVMEDIA_TYPE_UNKNOWN;
++        return 1;
++    }
++
++    return 0;
++}
++
++static av_cold int dash_parse_codecs(AVFormatContext *s,
++                                     DASHParameters *par,
++                                     const xmlChar *value)
++{
++    int n;
++    char type;
++    int flags;
++
++    /* https://developer.mozilla.org/en-US/docs/Web/Media/Formats/codecs_parameter */
++    /* https://tools.ietf.org/html/rfc6381 */
++    if (3 == av_sscanf(value, "mp4%c.%d.%d%n", &type, &par->level, &par->profile, &n) &&
++        !value[n])
++    {
+         switch (type) {
+-        case 'D':
+-            days = (uint32_t)value;
+-            break;
+-        case 'H':
+-            hours = (uint32_t)value;
+-            break;
+-        case 'M':
+-            mins = (uint32_t)value;
+-            break;
+-        case 'S':
+-            secs = (uint32_t)value;
+-            break;
+-        default:
+-            // handle invalid type
+-            break;
++        case 'a': par->codec_type = AVMEDIA_TYPE_AUDIO; break;
++        case 'v': par->codec_type = AVMEDIA_TYPE_VIDEO; break;
++        default: return 1;
+         }
+-        ptr += size;
++
++    } else if (3 == av_sscanf(value, "avc1"/* avcoti */".%02x%02x%02x%n",
++                              &par->profile, &flags, &par->level, &n) &&
++               !value[n])
++    {
++        par->codec_type = AVMEDIA_TYPE_VIDEO;
++        par->codec_id = AV_CODEC_ID_H264;
++        par->profile |= (unsigned)flags << 7;
++    } else if (av_sscanf(value, "hev1.%n", &n), n == 5)
++    {
++        par->codec_id = AV_CODEC_ID_HEVC;
++    } else {
++        par->codec_id = AV_CODEC_ID_NONE;
++        return 1;
+     }
+-    return  ((days * 24 + hours) * 60 + mins) * 60 + secs;
++
++    return 0;
+ }
+
+-static int64_t get_segment_start_time_based_on_timeline(struct representation *pls, int64_t cur_seq_no)
++static av_cold int dash_parse_scantype(AVFormatContext *s,
++                                       DASHParameters *par,
++                                       const xmlChar *value)
+ {
+-    int64_t start_time = 0;
+-    int64_t i = 0;
+-    int64_t j = 0;
+-    int64_t num = 0;
+-
+-    if (pls->n_timelines) {
+-        for (i = 0; i < pls->n_timelines; i++) {
+-            if (pls->timelines[i]->starttime > 0) {
+-                start_time = pls->timelines[i]->starttime;
+-            }
+-            if (num == cur_seq_no)
+-                goto finish;
++    if (!strcmp(value, "progressive")) {
++        par->field_order = AV_FIELD_PROGRESSIVE;
++    } else {
++        par->field_order = AV_FIELD_UNKNOWN;
++        return 1;
++    }
+
+-            start_time += pls->timelines[i]->duration;
++    return 0;
++}
+
+-            if (pls->timelines[i]->repeat == -1) {
+-                start_time = pls->timelines[i]->duration * cur_seq_no;
+-                goto finish;
+-            }
++static av_cold int dash_parse_parameters(AVFormatContext *s,
++                                         DASHParameters *par,
++                                         xmlAttrPtr attr,
++                                         const xmlChar *value)
++{
++    if (!strcmp(attr->name, "height"))
++        (void)av_sscanf(value, "%d", &par->height);
++    else if (!strcmp(attr->name, "width"))
++        (void)av_sscanf(value, "%d", &par->width);
++    else if (!strcmp(attr->name, "mimeType"))
++        return dash_parse_mimetype(par, value);
++    else if (!strcmp(attr->name, "audioSamplingRate"))
++        (void)av_sscanf(value, "%d", &par->sample_rate);
++    else if (!strcmp(attr->name, "par"))
++        /* Ignore. */;
++    else if (!strcmp(attr->name, "sar"))
++        (void)av_parse_ratio(&par->sample_aspect_ratio, value, INT_MAX, AV_LOG_ERROR, s);
++    else if (!strcmp(attr->name, "frameRate"))
++        (void)av_sscanf(value, "%d", &par->frame_rate);
++    else if (!strcmp(attr->name, "codecs"))
++        return dash_parse_codecs(s, par, value);
++    else if (!strcmp(attr->name, "scanType"))
++        return dash_parse_scantype(s, par, value);
++    else if (!strcmp(attr->name, "contentType"))
++        return dash_parse_contenttype(s, par, value);
++    else
++        return 1;
++
++    return 0;
++}
+
+-            for (j = 0; j < pls->timelines[i]->repeat; j++) {
+-                num++;
+-                if (num == cur_seq_no)
+-                    goto finish;
+-                start_time += pls->timelines[i]->duration;
+-            }
+-            num++;
+-        }
++static av_cold int dash_parse_audiochannelconfiguration(AVFormatContext *s,
++                                                        DASHParameters *par,
++                                                        xmlNodePtr node)
++{
++    int ret = 0;
++    DASHScheme scheme;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 1, node)) < 0)
++        goto out;
++
++    par->channels = 0;
++    par->channel_layout = 0;
++    par->matrix_encoding = AV_MATRIX_ENCODING_NONE;
++
++    /* https://testassets.dashif.org/#testvector/details/586fb3879ae9045678eacd10 */
++    if (!strcmp(scheme.scheme_id, "urn:dolby:dash:audio_channel_configuration:2011") ||
++        !strcmp(scheme.scheme_id, "tag:dolby.com,2014:dash:audio_channel_configuration:2011"))
++    {
++        par->matrix_encoding = AV_MATRIX_ENCODING_DOLBY;
++        (void)av_get_extended_channel_layout(scheme.value, &par->channel_layout, &par->channels);
++    } else if (!strcmp(scheme.scheme_id, "urn:mpeg:dash:23003:3:audio_channel_configuration:2011")) {
++        (void)av_sscanf(scheme.value, "%d", &par->channels);
++        par->channel_layout = av_get_default_channel_layout(par->channels);
++    } else {
++        (void)av_get_extended_channel_layout(scheme.value, &par->channel_layout, &par->channels);
++        dash_log_unknown_scheme(s, &scheme);
+     }
+-finish:
+-    return start_time;
++
++out:
++    dash_free_scheme(&scheme);
++    return ret;
+ }
+
+-static int64_t calc_next_seg_no_from_timelines(struct representation *pls, int64_t cur_time)
++static av_cold int dash_parse_assetidentifier(AVFormatContext *s,
++                                              DASHPeriod *period,
++                                              xmlNodePtr node)
+ {
+-    int64_t i = 0;
+-    int64_t j = 0;
+-    int64_t num = 0;
+-    int64_t start_time = 0;
++    int ret = 0;
++    DASHScheme scheme;
+
+-    for (i = 0; i < pls->n_timelines; i++) {
+-        if (pls->timelines[i]->starttime > 0) {
+-            start_time = pls->timelines[i]->starttime;
+-        }
+-        if (start_time > cur_time)
+-            goto finish;
+-
+-        start_time += pls->timelines[i]->duration;
+-        for (j = 0; j < pls->timelines[i]->repeat; j++) {
+-            num++;
+-            if (start_time > cur_time)
+-                goto finish;
+-            start_time += pls->timelines[i]->duration;
+-        }
+-        num++;
+-    }
++    if ((ret = dash_parse_scheme(s, &scheme, 1, node)) < 0)
++        goto out;
+
+-    return -1;
++    if (!strcmp(scheme.scheme_id, "urn:org:dashif:asset-id:2013")) {
++        av_dict_set(&period->metadata, "asset_identifier", scheme.value, 0);
++    } else {
++        dash_log_unknown_scheme(s, &scheme);
++    }
+
+-finish:
+-    return num;
++out:
++    dash_free_scheme(&scheme);
++    return ret;
+ }
+
+-static void free_fragment(struct fragment **seg)
++static av_cold int dash_parse_viewpoint(AVFormatContext *s,
++                                        DASHAdaptationSet *as,
++                                        xmlNodePtr node)
+ {
+-    if (!(*seg)) {
+-        return;
++    int ret = 0;
++    DASHScheme scheme;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 1, node)) < 0)
++        goto out;
++
++    /* https://testassets.dashif.org/#testvector/details/5cde78e4a5eeda55aa663101 */
++    if (!strcmp(scheme.scheme_id, "urn:mpeg:dash:viewpoint:2011")) {
++        av_dict_set(&as->metadata, "viewpoint", scheme.value, 0);
++    } else {
++        dash_log_unknown_scheme(s, &scheme);
+     }
+-    av_freep(&(*seg)->url);
+-    av_freep(seg);
++
++out:
++    dash_free_scheme(&scheme);
++    return ret;
+ }
+
+-static void free_fragment_list(struct representation *pls)
++static av_cold void dash_sync_time(AVFormatContext *s, const xmlChar *value)
+ {
+-    int i;
++    DASHContext *c = s->priv_data;
++    int ret = 0;
++
++    switch (c->utc_timing) {
++    case DASH_UTC_TIMING_LOCAL:
++    default:
++        ret = 1;
++        break;
++    case DASH_UTC_TIMING_HTTP_XSDATE:
++    case DASH_UTC_TIMING_HTTP_ISO:
++    case DASH_UTC_TIMING_HTTP_NTP:
++    case DASH_UTC_TIMING_NTP:
++    case DASH_UTC_TIMING_HTTP_HEAD:
++    case DASH_UTC_TIMING_DIRECT:
++        ret = AVERROR_PATCHWELCOME;
++        break;
++    }
+
+-    for (i = 0; i < pls->n_fragments; i++) {
+-        free_fragment(&pls->fragments[i]);
++    if (!ret) {
++        av_log(s, AV_LOG_DEBUG, "Time synchronized: %lf s\n",
++               (double)c->time_diff / AV_TIME_BASE);
++        c->utc_timing = -c->utc_timing;
++    } else if (ret < 0) {
++        av_log(s, AV_LOG_ERROR, "Failed to synchronized time: %s\n",
++               av_err2str(ret));
+     }
+-    av_freep(&pls->fragments);
+-    pls->n_fragments = 0;
+ }
+
+-static void free_timelines_list(struct representation *pls)
++static av_cold int dash_parse_utctiming(AVFormatContext *s,
++                                        xmlNodePtr node)
+ {
+-    int i;
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHScheme scheme;
++    int utc_timing = c->utc_timing;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 0, node)) < 0)
++        goto out;
++
++    c->utc_timing = DASH_UTC_TIMING_LOCAL;
++
++    if (0);
++#define PARSE(name, scheme_name) \
++    else if (!strcmp(scheme.scheme_id, "urn:mpeg:dash:utc:"scheme_name":2014")) \
++        c->utc_timing = DASH_UTC_TIMING_##name
++    PARSE(HTTP_XSDATE, "http-xsdate");
++    PARSE(HTTP_ISO,    "http-iso");
++    PARSE(HTTP_NTP,    "http-ntp");
++    PARSE(NTP,         "ntp");
++    PARSE(HTTP_HEAD,   "http-head");
++    PARSE(DIRECT,      "direct");
++#undef PARSE
++    else
++        dash_log_unknown_scheme(s, &scheme);
++
++    if (c->utc_timing == -utc_timing)
++        c->utc_timing = utc_timing;
++
++    dash_sync_time(s, scheme.value);
++
++out:
++    dash_free_scheme(&scheme);
++    return ret;
++}
+
+-    for (i = 0; i < pls->n_timelines; i++) {
+-        av_freep(&pls->timelines[i]);
++static av_cold int dash_parse_role(AVFormatContext *s,
++                                   DASHParameters *par,
++                                   xmlNodePtr node)
++{
++    int ret = 0;
++    DASHScheme scheme;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 1, node)) < 0)
++        goto out;
++
++    /* https://testassets.dashif.org/#feature/details/588a48c27459f8cb201b881b */
++    if (!strcmp(scheme.scheme_id, "urn:mpeg:dash:role:2011")) {
++        if (!strcmp(scheme.value, "main"))
++            par->disposition |= AV_DISPOSITION_DEFAULT;
++        else if (!strcmp(scheme.value, "alternate"))
++            par->disposition &= ~AV_DISPOSITION_DEFAULT;
++        else if (!strcmp(scheme.value, "original"))
++            par->disposition |= AV_DISPOSITION_ORIGINAL;
++        else if (!strcmp(scheme.value, "dub"))
++            par->disposition |= AV_DISPOSITION_DUB;
++        else if (!strcmp(scheme.value, "subtitle"))
++            par->codec_type = AVMEDIA_TYPE_SUBTITLE;
++    } else {
++        dash_log_unknown_scheme(s, &scheme);
+     }
+-    av_freep(&pls->timelines);
+-    pls->n_timelines = 0;
++
++out:
++    dash_free_scheme(&scheme);
++    return ret;
+ }
+
+-static void free_representation(struct representation *pls)
++static av_cold int dash_parse_property(AVFormatContext *s,
++                                       DASHAdaptationSet *as,
++                                       DASHRepresentationPeriod *rep,
++                                       xmlNodePtr node)
+ {
+-    free_fragment_list(pls);
+-    free_timelines_list(pls);
+-    free_fragment(&pls->cur_seg);
+-    free_fragment(&pls->init_section);
+-    av_freep(&pls->init_sec_buf);
+-    av_freep(&pls->pb.buffer);
+-    ff_format_io_close(pls->parent, &pls->input);
+-    if (pls->ctx) {
+-        pls->ctx->pb = NULL;
+-        avformat_close_input(&pls->ctx);
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHScheme scheme;
++
++    if ((ret = dash_parse_scheme(s, &scheme, 1, node)) < 0)
++        goto out;
++
++    /* https://testassets.dashif.org/#feature/details/588a48c27459f8cb201b881b */
++    if ((!as && !rep) && !strcmp(scheme.scheme_id, "urn:mpeg:dash:chaining:2016")) {
++        xml_free(c->chain_next_location);
++        c->chain_next_location = scheme.value;
++        scheme.value = NULL;
++    } else if ((!as && !rep) && !strcmp(scheme.scheme_id, "urn:mpeg:dash:fallback:2016")) {
++        xml_free(c->fallback_location);
++        c->fallback_location = scheme.value;
++        scheme.value = NULL;
++    } else {
++        dash_log_unknown_scheme(s, &scheme);
+     }
+
+-    av_freep(&pls->url_template);
+-    av_freep(&pls->lang);
+-    av_freep(&pls->id);
+-    av_freep(&pls);
++out:
++    dash_free_scheme(&scheme);
++    return ret;
+ }
+
+-static void free_video_list(DASHContext *c)
++static av_cold int dash_check_existing_timeline(AVFormatContext *s, DASHTimeline **out_timeline, xmlNodePtr timeline_node)
+ {
+-    int i;
+-    for (i = 0; i < c->n_videos; i++) {
+-        struct representation *pls = c->videos[i];
+-        free_representation(pls);
+-    }
+-    av_freep(&c->videos);
+-    c->n_videos = 0;
++    if (!*out_timeline)
++        return 0;
++
++    av_log(s, AV_LOG_ERROR, "Multiple timelines specified\n");
++    dash_log_unknown_child(s, timeline_node);
++
++    return AVERROR_INVALIDDATA;
+ }
+
+-static void free_audio_list(DASHContext *c)
++static int dash_parse_segmentlist(AVFormatContext *s,
++                                  DASHPeriod *period,
++                                  DASHTimeline **out_timeline,
++                                  xmlNodePtr node)
+ {
+-    int i;
+-    for (i = 0; i < c->n_audios; i++) {
+-        struct representation *pls = c->audios[i];
+-        free_representation(pls);
++    int nb_segments = 0;
++    int64_t duration = 0;
++    int64_t timescale = 1;
++    DASHTimeline *timeline = NULL;
++    DASHSegment *g;
++    int ret = 0;
++
++    if ((ret = dash_check_existing_timeline(s, out_timeline, node) < 0))
++        return ret;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "duration"))
++            (void)av_sscanf(value, "%"SCNd64, &duration);
++        else if (!strcmp(attr->name, "timescale"))
++            (void)av_sscanf(value, "%"SCNd64, &timescale);
++        else
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    xml_for_each_child {
++        if (!strcmp(child->name, "SegmentURL"))
++            ++nb_segments;
++        else
++            dash_log_unknown_child(s, child);
++    }
++
++    if (!(timeline = av_mallocz(offsetof(DASHTimeline, u.segments.elems[nb_segments])))) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    dash_ref_timeline(timeline);
++    timeline->type = TIMELINE_SEGMENTS;
++    timeline->u.segments.nb = nb_segments;
++    g = &timeline->u.segments.elems[0];
++
++    xml_for_each_child {
++        xmlNodePtr node = child;
++
++        if (strcmp(node->name, "SegmentURL"))
++            continue;
++
++        xml_for_each_attr {
++            if (!strcmp(attr->name, "media")) {
++                g->url = value;
++                value = NULL;
++            } else
++                dash_log_unknown_attr(s, attr, value);
++        }
++        if (!g->url) {
++            dash_log_missing_attr(s, node, "media");
++            ret = AVERROR_INVALIDDATA;
++            goto out;
++        }
++
++        ++g;
+     }
+-    av_freep(&c->audios);
+-    c->n_audios = 0;
++
++    *out_timeline = dash_ref_timeline(timeline);
++
++out:
++    dash_unref_timeline(timeline);
++    return ret;
+ }
+
+-static void free_subtitle_list(DASHContext *c)
++static av_cold int dash_parse_segmenttimeline(AVFormatContext *s,
++                                              DASHPeriod *period,
++                                              uint64_t start_number,
++                                              DASHTimeline **out_timeline,
++                                              xmlNodePtr node)
+ {
+-    int i;
+-    for (i = 0; i < c->n_subtitles; i++) {
+-        struct representation *pls = c->subtitles[i];
+-        free_representation(pls);
++    int ret = 0;
++    unsigned nb_selems = 0;
++    DASHSegmentTemplate *g;
++    DASHTimeline *timeline;
++    int64_t start_ts = 0;
++
++    if ((ret = dash_check_existing_timeline(s, out_timeline, node) < 0))
++        return ret;
++
++    xml_for_each_attr {
++        dash_log_unknown_attr(s, attr, value);
++    }
++
++    xml_for_each_child {
++        if (!strcmp(child->name, "S"))
++            ++nb_selems;
++        else
++            dash_log_unknown_child(s, child);
++    }
++
++    if (!(timeline = av_malloc(offsetof(DASHTimeline, u.templates.elems[nb_selems])))) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    memset(timeline, 0, offsetof(DASHTimeline, u.templates.elems[0]));
++    dash_ref_timeline(timeline);
++    timeline->type = TIMELINE_TEMPLATES;
++    timeline->u.templates.nb = nb_selems;
++    g = &timeline->u.templates.elems[0];
++
++    xml_for_each_child {
++        xmlNodePtr node = child;
++
++        if (strcmp(node->name, "S"))
++            continue;
++
++        *g = (DASHSegmentTemplate){
++            .start_ts = start_ts,
++            .number = start_number
++        };
++
++        xml_for_each_attr {
++            int64_t num = 0;
++
++            (void)av_sscanf(value, "%"SCNd64, &num);
++
++            if (!strcmp(attr->name, "t")) {
++                /* Muste be increasing. */
++                if (num < start_ts) {
++                    dash_log_invalid_attr_value(s, attr, value);
++                    ret = AVERROR_INVALIDDATA;
++                    goto out;
++                }
++
++                g->start_ts = num;
++            } else if (!strcmp(attr->name, "n"))
++                g->number = num;
++            else if (!strcmp(attr->name, "r"))
++                g->repeat = num;
++            else if (!strcmp(attr->name, "d")) {
++                g->duration = num;
++
++                if (g->duration <= 0) {
++                    dash_log_invalid_attr_value(s, attr, value);
++                    ret = AVERROR_INVALIDDATA;
++                    goto out;
++                }
++            } else {
++                dash_log_unknown_attr(s, attr, value);
++            }
++        }
++
++        start_number = g->number + (g->repeat + 1);
++        start_ts = g->start_ts + g->duration * (g->repeat + 1);
++        ++g;
+     }
+-    av_freep(&c->subtitles);
+-    c->n_subtitles = 0;
++
++    *out_timeline = dash_ref_timeline(timeline);
++
++out:
++    dash_unref_timeline(timeline);
++    return ret;
+ }
+
+-static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+-                    AVDictionary **opts, AVDictionary *opts2, int *is_http)
++/* One init URL and list of template arguments. */
++static av_cold int dash_parse_segmenttemplate(AVFormatContext *s,
++                                              DASHPeriod *period,
++                                              DASHTimeline **out_timeline,
++                                              xmlNodePtr node)
+ {
+-    DASHContext *c = s->priv_data;
+-    AVDictionary *tmp = NULL;
+-    const char *proto_name = NULL;
+-    int ret;
+-
+-    if (av_strstart(url, "crypto", NULL)) {
+-        if (url[6] == '+' || url[6] == ':')
+-            proto_name = avio_find_protocol_name(url + 7);
++    int ret = 0;
++    DASHTimeline *timeline = NULL;
++    int64_t duration = -1;
++    uint64_t start_number = 1;
++    int64_t presentation_time_offset = 0;
++    int64_t timescale = 1;
++    xmlChar *init_url = NULL;
++    xmlChar *media_url = NULL;
++
++    if ((ret = dash_check_existing_timeline(s, out_timeline, node) < 0))
++        return ret;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "startNumber"))
++            (void)av_sscanf(value, "%"SCNu64, &start_number);
++        else if (!strcmp(attr->name, "duration")) {
++            (void)av_sscanf(value, "%"SCNd64, &duration);
++            if (duration < 0) {
++                dash_log_invalid_attr_value(s, attr, value);
++                ret = AVERROR_INVALIDDATA;
++            }
++        } else if (!strcmp(attr->name, "presentationTimeOffset"))
++            (void)av_sscanf(value, "%"SCNu64, &presentation_time_offset);
++        else if (!strcmp(attr->name, "timescale")) {
++            (void)av_sscanf(value, "%"SCNd64, &timescale);
++            if (timescale <= 0) {
++                dash_log_invalid_attr_value(s, attr, value);
++                ret = AVERROR_INVALIDDATA;
++            }
++        } else if (!strcmp(attr->name, "initialization")) {
++            init_url = value;
++            value = NULL;
++        } else if (!strcmp(attr->name, "media")) {
++            media_url = value;
++            value = NULL;
++        } else
++            dash_log_unknown_attr(s, attr, value);
+     }
+
+-    if (!proto_name)
+-        proto_name = avio_find_protocol_name(url);
++    /* value has to be free()'d */
++    if (ret < 0)
++        goto out;
+
+-    if (!proto_name)
+-        return AVERROR_INVALIDDATA;
++    if (!init_url || !media_url) {
++        ret = AVERROR_INVALIDDATA;
++        dash_log_missing_attr(s, node, !init_url ? "initialization" : "media");
++        goto out;
++    }
+
+-    // only http(s) & file are allowed
+-    if (av_strstart(proto_name, "file", NULL)) {
+-        if (strcmp(c->allowed_extensions, "ALL") && !av_match_ext(url, c->allowed_extensions)) {
+-            av_log(s, AV_LOG_ERROR,
+-                   "Filename extension of \'%s\' is not a common multimedia extension, blocked for security reasons.\n"
+-                   "If you wish to override this adjust allowed_extensions, you can set it to \'ALL\' to allow all\n",
+-                   url);
+-            return AVERROR_INVALIDDATA;
++    if (0 <= duration) {
++        DASHSegmentTemplate *g;
++
++        if (!(timeline = av_mallocz(offsetof(DASHTimeline, u.templates.elems[1])))) {
++            ret = AVERROR(ENOMEM);
++            goto out;
++        }
++        dash_ref_timeline(timeline);
++        timeline->type = TIMELINE_TEMPLATES;
++        timeline->u.templates.nb = 1;
++        g = &timeline->u.templates.elems[0];
++        g->start_ts = 0;
++        g->number = start_number;
++        g->repeat = INT64_MAX;
++        /* We round down in order to fetch segments more instead before than after. */
++        g->duration =  duration; /* av_rescale_rnd(duration, AV_TIME_BASE, timescale, AV_ROUND_DOWN); */
++    } else {
++        xml_for_each_child {
++            if (!strcmp(child->name, "SegmentTimeline"))
++                ret = dash_parse_segmenttimeline(s, period, start_number, &timeline, child);
++            else
++                dash_log_unknown_child(s, child);
++
++            if (ret < 0)
++                goto out;
+         }
+-    } else if (av_strstart(proto_name, "http", NULL)) {
+-        ;
+-    } else
+-        return AVERROR_INVALIDDATA;
+-
+-    if (!strncmp(proto_name, url, strlen(proto_name)) && url[strlen(proto_name)] == ':')
+-        ;
+-    else if (av_strstart(url, "crypto", NULL) && !strncmp(proto_name, url + 7, strlen(proto_name)) && url[7 + strlen(proto_name)] == ':')
+-        ;
+-    else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
+-        return AVERROR_INVALIDDATA;
+-
+-    av_freep(pb);
+-    av_dict_copy(&tmp, *opts, 0);
+-    av_dict_copy(&tmp, opts2, 0);
+-    ret = avio_open2(pb, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp);
+-    if (ret >= 0) {
+-        // update cookies on http response with setcookies.
+-        char *new_cookies = NULL;
+-
+-        if (!(s->flags & AVFMT_FLAG_CUSTOM_IO))
+-            av_opt_get(*pb, "cookies", AV_OPT_SEARCH_CHILDREN, (uint8_t**)&new_cookies);
+-
+-        if (new_cookies) {
+-            av_dict_set(opts, "cookies", new_cookies, AV_DICT_DONT_STRDUP_VAL);
++
++        /* Either a SegmentTemplate at duration or a SegmentTimeline must be
++         * given. */
++        if (!timeline) {
++            av_log(s, AV_LOG_ERROR, "Missing %s/%s",
++                   node->name, "SegmentTimeline");
++            ret = AVERROR_INVALIDDATA;
++            goto out;
+         }
+
+     }
+
+-    av_dict_free(&tmp);
++    timeline->duration = INT64_MAX;
++    timeline->timescale = timescale;
++    timeline->init.range = DASH_RANGE_INITALIZER;
++    timeline->init.url = init_url;
++    init_url = NULL;
++    timeline->u.templates.master.url = media_url;
++    media_url = NULL;
+
+-    if (is_http)
+-        *is_http = av_strstart(proto_name, "http", NULL);
++    timeline->u.templates.master.range = DASH_RANGE_INITALIZER;
+
++    *out_timeline = dash_ref_timeline(timeline);
++
++out:
++    xml_free(init_url);
++    xml_free(media_url);
++    dash_unref_timeline(timeline);
+     return ret;
+ }
+
+-static char *get_content_url(xmlNodePtr *baseurl_nodes,
+-                             int n_baseurl_nodes,
+-                             int max_url_size,
+-                             char *rep_id_val,
+-                             char *rep_bandwidth_val,
+-                             char *val)
++static DASHRange dash_parse_range(const char *s, AVFormatContext *log_ctx)
+ {
+-    int i;
+-    char *text;
+-    char *url = NULL;
+-    char *tmp_str = av_mallocz(max_url_size);
++    DASHRange range = {
++        .start = 0,
++        .end = INT64_MAX
++    };
++    (void)av_sscanf(s, "%"SCNd64"-%"SCNd64, &range.start, &range.end);
++    return range;
++}
++
++static int dash_parse_segmentbase(AVFormatContext *s,
++                                  DASHPeriod *period,
++                                  DASHTimeline **out_timeline,
++                                  xmlNodePtr node)
++{
++    int ret = 0;
++    DASHSegment *g;
++    DASHTimeline *timeline;
++
++    if ((ret = dash_check_existing_timeline(s, out_timeline, node) < 0))
++        return ret;
++
++    if (!(timeline = av_mallocz(offsetof(DASHTimeline, u.segments.elems[1])))) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    dash_ref_timeline(timeline);
++    timeline->type = TIMELINE_SEGMENTS;
++    timeline->duration = INT64_MAX;
++    timeline->u.segments.nb = 1;
++    g = &timeline->u.segments.elems[0];
++
++    abort();
++    xml_for_each_child {
++        if (!strcmp(child->name, "Initalization")) {
++            xmlNodePtr node = child;
++            xml_for_each_attr {
++                if (!strcmp(attr->name, "range"))
++                    timeline->init.range = dash_parse_range(value, s);
++                else
++                    dash_log_unknown_attr(s, attr, value);
++            }
++        } else
++            dash_log_unknown_child(s, child);
++    }
++
++    (void)g;
++
++    *out_timeline = dash_ref_timeline(timeline);
++
++out:
++    dash_unref_timeline(timeline);
++    return 0;
++}
++
++/**
++ * Substitute template arguments in |template| if not NULL and make an URL by
++ * joining it to the absolute |base| part.
++ * @param base Absolute base path.
++ * @param template Absolute or relative path, potentially containing $ template
++ *                 arguments. May be NULL.
++ * @return The allocated URL that shall be av_free()d by the caller.
++ */
++static char *dash_make_url(const char *base, const char *template,
++                           /* Template arguments. */
++                           const char *$RepresentationID$,
++                           uint64_t $Number$,
++                           int64_t $Time$,
++                           uint32_t $Bandwidth$)
++{
++    enum { MAX_DIGITS = 20 };
++
++    size_t base_size;
++    size_t $RepresentationID$_size = strlen($RepresentationID$);
++    size_t max_url_size;
++    char *url, *u;
++    URLComponents uc;
++
++    ff_url_decompose(&uc, template, NULL);
++    base_size = URL_COMPONENT_HAVE(uc, scheme) ? 0 : strlen(base);
++
++    max_url_size = base_size +
++                   (template ? strlen(template) : 0) +
++                   $RepresentationID$_size +
++                   (MAX_DIGITS * 3) + 1 /* NUL */;
+
+-    if (!tmp_str)
++    if (!(url = av_malloc(max_url_size)))
+         return NULL;
+
+-    for (i = 0; i < n_baseurl_nodes; ++i) {
+-        if (baseurl_nodes[i] &&
+-            baseurl_nodes[i]->children &&
+-            baseurl_nodes[i]->children->type == XML_TEXT_NODE) {
+-            text = xmlNodeGetContent(baseurl_nodes[i]->children);
+-            if (text) {
+-                memset(tmp_str, 0, max_url_size);
+-                ff_make_absolute_url(tmp_str, max_url_size, "", text);
+-                xmlFree(text);
++    memcpy(url, base, base_size);
++    u = url + base_size;
++
++    while (template && *template) {
++        char *t;
++
++        if ((t = strchr(template, '$'))) {
++            size_t len;
++            unsigned digits;
++
++            /* Append everything before $. */
++            len = t - template;
++            memcpy(u, template, len);
++            u += len;
++            template = t + 1;
++
++            /* Get length of template name. */
++            len = strcspn(template, "$%");
++
++            /* Parse formatting. It's easy because we have only one
++             * possibility. */
++            digits = 0;
++            (void)av_sscanf(template + len, "%%0%ud$", &digits);
++            if (MAX_DIGITS < digits)
++                digits = MAX_DIGITS;
++
++#define IS(name) (len == sizeof(name) - 1 && !memcmp(template, name, sizeof(name) - 1))
++
++            /* Substitute template argument. */
++            if (IS("RepresentationID")) {
++                memcpy(u, $RepresentationID$, $RepresentationID$_size);
++                u += $RepresentationID$_size;
++            } else if (IS("Time")) {
++                u += sprintf(u, "%0*"PRId64, digits, $Time$);
++            } else if (IS("Bandwidth")) {
++                u += sprintf(u, "%0*"PRIu32, digits, $Bandwidth$);
++            } else if (IS("Number")) {
++                u += sprintf(u, "%0*"PRIu64, digits, $Number$);
++            } else if (IS("")) {
++                *u++ = '$';
+             }
+-        }
+-    }
+
+-    if (val)
+-        ff_make_absolute_url(tmp_str, max_url_size, tmp_str, val);
++#undef IS
+
+-    if (rep_id_val) {
+-        url = av_strireplace(tmp_str, "$RepresentationID$", rep_id_val);
+-        if (!url) {
+-            goto end;
++            /* Go over $. */
++            if ((template = strchr(template + len, '$')))
++                ++template;
++        } else {
++            /* Copy remaining. */
++            strcpy(u, template);
++            break;
+         }
+-        av_strlcpy(tmp_str, url, max_url_size);
+     }
+-    if (rep_bandwidth_val && tmp_str[0] != '\0') {
+-        // free any previously assigned url before reassigning
+-        av_free(url);
+-        url = av_strireplace(tmp_str, "$Bandwidth$", rep_bandwidth_val);
+-        if (!url) {
+-            goto end;
+-        }
+-    }
+-end:
+-    av_free(tmp_str);
++
+     return url;
+ }
+
+-static char *get_val_from_nodes_tab(xmlNodePtr *nodes, const int n_nodes, const char *attrname)
++static int64_t dash_subdemuxer_seek(void *opaque, int64_t offset, int whence)
+ {
+-    int i;
+-    char *val;
+-
+-    for (i = 0; i < n_nodes; ++i) {
+-        if (nodes[i]) {
+-            val = xmlGetProp(nodes[i], attrname);
+-            if (val)
+-                return val;
+-        }
+-    }
+-
+-    return NULL;
++    DASHRepresentation *rep = opaque;
++    return avio_seek(rep->segments[0].pb, offset, whence);
+ }
+
+-static xmlNodePtr find_child_node_by_name(xmlNodePtr rootnode, const char *nodename)
++static av_cold int dash_copy_stream_props(AVStream *slave, AVStream *master)
+ {
+-    xmlNodePtr node = rootnode;
+-    if (!node) {
+-        return NULL;
+-    }
++    int ret;
+
+-    node = xmlFirstElementChild(node);
+-    while (node) {
+-        if (!av_strcasecmp(node->name, nodename)) {
+-            return node;
+-        }
+-        node = xmlNextElementSibling(node);
+-    }
+-    return NULL;
++    master->event_flags &= ~AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
++    slave->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
++
++    slave->internal->need_context_update = 1;
++
++    if ((ret = ff_stream_encode_params_copy(slave, master)) < 0)
++        return ret;
++
++    /* Only for probed context (oc->iformat != NULL). */
++    if (master->time_base.den)
++        avpriv_set_pts_info(slave, master->pts_wrap_bits,
++                            master->time_base.num, master->time_base.den);
++
++    return 0;
+ }
+
+-static enum AVMediaType get_content_type(xmlNodePtr node)
++static av_cold DASHRepresentationPeriod *dash_find_representation_period_at(
++        DASHRepresentation *rep, int64_t timestamp)
+ {
+-    enum AVMediaType type = AVMEDIA_TYPE_UNKNOWN;
+-    int i = 0;
+-    const char *attr;
+-    char *val = NULL;
+-
+-    if (node) {
+-        for (i = 0; i < 2; i++) {
+-            attr = i ? "mimeType" : "contentType";
+-            val = xmlGetProp(node, attr);
+-            if (val) {
+-                if (av_stristr(val, "video")) {
+-                    type = AVMEDIA_TYPE_VIDEO;
+-                } else if (av_stristr(val, "audio")) {
+-                    type = AVMEDIA_TYPE_AUDIO;
+-                } else if (av_stristr(val, "text")) {
+-                    type = AVMEDIA_TYPE_SUBTITLE;
+-                }
+-                xmlFree(val);
+-            }
+-        }
++    for (unsigned i = 0; i < rep->nb_periods; ++i) {
++        DASHRepresentationPeriod *period = rep->periods[i];
++        if (period->period->start_ts <= timestamp &&
++                                        timestamp < period->period->end_ts)
++            return period;
+     }
+-    return type;
++
++    return NULL;
+ }
+
+-static struct fragment * get_Fragment(char *range)
++/**
++ * Update everything to make outside context of representation.
++ *
++ * Must be called after:
++ * - rep->ic->streams changed,
++ * - rep->cur_period changed.
++ */
++static av_cold int dash_subdemuxer_update(DASHRepresentation *rep)
+ {
+-    struct fragment * seg =  av_mallocz(sizeof(struct fragment));
+-
+-    if (!seg)
+-        return NULL;
++    int ret;
++    void *p;
++    AVFormatContext *oc = rep->oc;
++    AVFormatContext *ic = rep->ic;
+
+-    seg->size = -1;
+-    if (range) {
+-        char *str_end_offset;
+-        char *str_offset = av_strtok(range, "-", &str_end_offset);
+-        seg->url_offset = strtoll(str_offset, NULL, 10);
+-        seg->size = strtoll(str_end_offset, NULL, 10) - seg->url_offset + 1;
++    if (rep->nb_streams < ic->nb_streams) {
++        if (!(p = av_realloc(rep->ostreams, ic->nb_streams * sizeof(*rep->ostreams))))
++            return AVERROR(ENOMEM);
++        rep->ostreams = p;
+     }
+
+-    return seg;
+-}
++    rep->ic->event_flags &= ~AVFMT_EVENT_FLAG_METADATA_UPDATED;
++    rep->oc->event_flags |= AVFMT_EVENT_FLAG_METADATA_UPDATED;
+
+-static int parse_manifest_segmenturlnode(AVFormatContext *s, struct representation *rep,
+-                                         xmlNodePtr fragmenturl_node,
+-                                         xmlNodePtr *baseurl_nodes,
+-                                         char *rep_id_val,
+-                                         char *rep_bandwidth_val)
+-{
+-    DASHContext *c = s->priv_data;
+-    char *initialization_val = NULL;
+-    char *media_val = NULL;
+-    char *range_val = NULL;
+-    int max_url_size = c ? c->max_url_size: MAX_URL_SIZE;
+-    int err;
+-
+-    if (!av_strcasecmp(fragmenturl_node->name, "Initialization")) {
+-        initialization_val = xmlGetProp(fragmenturl_node, "sourceURL");
+-        range_val = xmlGetProp(fragmenturl_node, "range");
+-        if (initialization_val || range_val) {
+-            free_fragment(&rep->init_section);
+-            rep->init_section = get_Fragment(range_val);
+-            xmlFree(range_val);
+-            if (!rep->init_section) {
+-                xmlFree(initialization_val);
+-                return AVERROR(ENOMEM);
+-            }
+-            rep->init_section->url = get_content_url(baseurl_nodes, 4,
+-                                                     max_url_size,
+-                                                     rep_id_val,
+-                                                     rep_bandwidth_val,
+-                                                     initialization_val);
+-            xmlFree(initialization_val);
+-            if (!rep->init_section->url) {
+-                av_freep(&rep->init_section);
++    for (unsigned stream_index = 0;
++         stream_index < ic->nb_streams;
++         stream_index++)
++    {
++        AVStream *ist, *ost;
++        DASHRepresentationPeriod *period;
++        AVDictionary *metadata = NULL;
++
++        ist = ic->streams[stream_index];
++
++        if (stream_index < rep->nb_streams) {
++            ost = rep->ostreams[stream_index];
++        } else {
++            ost = avformat_new_stream(oc, NULL);
++            if (!ost)
+                 return AVERROR(ENOMEM);
+-            }
++
++            rep->ostreams[stream_index] = ost;
+         }
+-    } else if (!av_strcasecmp(fragmenturl_node->name, "SegmentURL")) {
+-        media_val = xmlGetProp(fragmenturl_node, "media");
+-        range_val = xmlGetProp(fragmenturl_node, "mediaRange");
+-        if (media_val || range_val) {
+-            struct fragment *seg = get_Fragment(range_val);
+-            xmlFree(range_val);
+-            if (!seg) {
+-                xmlFree(media_val);
+-                return AVERROR(ENOMEM);
+-            }
+-            seg->url = get_content_url(baseurl_nodes, 4,
+-                                       max_url_size,
+-                                       rep_id_val,
+-                                       rep_bandwidth_val,
+-                                       media_val);
+-            xmlFree(media_val);
+-            if (!seg->url) {
+-                av_free(seg);
++
++        av_log(oc, AV_LOG_VERBOSE,
++               "Match '%s', stream #%u -> DASH stream #%u\n",
++               rep->id, stream_index, ost->index);
++
++        /* Period specific metadata. */
++        period = rep->cur_period;
++        /* For inactive representations compute where we would be. */
++        if (!period)
++            period = dash_find_representation_period_at(rep, rep->read_ts);
++        if (period) {
++            const DASHParameters *par = &period->par;
++            uint8_t *side_data;
++            int side_data_size;
++
++            side_data = av_encryption_init_info_add_side_data(period->as->init_info, &side_data_size);
++            if (!side_data)
+                 return AVERROR(ENOMEM);
++
++            ret = av_stream_add_side_data(ist, AV_PKT_DATA_ENCRYPTION_INIT_INFO,
++                                          side_data, side_data_size);
++            if (ret < 0) {
++                av_free(side_data);
++                return ret;
+             }
+-            err = av_dynarray_add_nofree(&rep->fragments, &rep->n_fragments, seg);
+-            if (err < 0) {
+-                free_fragment(&seg);
+-                return err;
++
++            av_dict_set_int(&metadata, "variant_bitrate", period->bandwidth, AV_DICT_MULTIKEY);
++
++            /* AdaptationSet specific metadata. */
++            av_dict_copy(&metadata, period->as->metadata, AV_DICT_MULTIKEY);
++
++            /* Most parameters are only relevant for elementary streams. */
++            if (rep->ic->nb_streams == 1) {
++                AVCodecParameters *codecpar = ist->codecpar;
++
++                /* Set unknown parameters for manifest. */
++
++                if (codecpar->codec_type == AVMEDIA_TYPE_UNKNOWN)
++                    codecpar->codec_type = par->codec_type;
++
++                if (codecpar->codec_id == AV_CODEC_ID_NONE)
++                    codecpar->codec_id = par->codec_id;
++
++                if (!codecpar->sample_rate)
++                    codecpar->sample_rate = par->sample_rate;
++
++                if (!codecpar->channels && !codecpar->channel_layout)
++                    codecpar->channels = par->channels,
++                    codecpar->channel_layout = par->channel_layout;
++
++                if (!codecpar->width && !codecpar->height)
++                    codecpar->width = par->width,
++                    codecpar->height = par->height;
++
++                if (!ist->avg_frame_rate.num)
++                    ist->avg_frame_rate = par->frame_rate;
++                if (!ist->r_frame_rate.num)
++                    ist->r_frame_rate = par->frame_rate;
++
++                if (!codecpar->sample_aspect_ratio.num)
++                    codecpar->sample_aspect_ratio = par->sample_aspect_ratio;
++
++                if (codecpar->field_order == AV_FIELD_UNKNOWN)
++                    codecpar->field_order = par->field_order;
+             }
++
++            ist->disposition = par->disposition;
++        }
++
++        /* Representation specific metadata. */
++        av_dict_set(&metadata, "id", rep->id, AV_DICT_MULTIKEY);
++
++        /* RepresentationPeriod (stream) specific metadata. */
++        if ((ret = dash_copy_stream_props(ost, ist)) < 0) {
++            av_dict_free(&metadata);
++            return ret;
+         }
++
++        av_dict_copy(&ost->metadata, metadata, AV_DICT_MULTIKEY);
++        av_dict_free(&metadata);
++    }
++
++    for (unsigned stream_index = ic->nb_streams;
++         stream_index < rep->nb_streams;
++         stream_index++)
++    {
++        AVStream *ist, *ost;
++
++        /* Dummy format with no streams. */
++        if (!ic->streams)
++            break;
++
++        ist = ic->streams[stream_index];
++        ost = rep->ostreams[stream_index];
++
++        /* Reset codec parameters. */
++        avcodec_parameters_free(&ist->codecpar);
++        ist->codecpar = avcodec_parameters_alloc();
++        if (!ist->codecpar)
++            return AVERROR(ENOMEM);
++
++        if ((ret = dash_copy_stream_props(ost, ist)) < 0)
++            return ret;
+     }
+
++    rep->nb_streams = FFMAX(rep->nb_streams, ic->nb_streams);
++
+     return 0;
+ }
+
+-static int parse_manifest_segmenttimeline(AVFormatContext *s, struct representation *rep,
+-                                          xmlNodePtr fragment_timeline_node)
++static void dash_rotate_urllist(AVFormatContext *s, DASHURLList *urls)
+ {
+-    xmlAttrPtr attr = NULL;
+-    char *val  = NULL;
+-    int err;
++    DASHContext *c = s->priv_data;
+
+-    if (!av_strcasecmp(fragment_timeline_node->name, "S")) {
+-        struct timeline *tml = av_mallocz(sizeof(struct timeline));
+-        if (!tml) {
+-            return AVERROR(ENOMEM);
+-        }
+-        attr = fragment_timeline_node->properties;
+-        while (attr) {
+-            val = xmlGetProp(fragment_timeline_node, attr->name);
++    if (1 < urls->nb) {
++        unsigned const i = 1 + av_lfg_get(&c->rnd) % (urls->nb - 1);
++        char *tmp     = urls->elems[i];
++        urls->elems[i] = urls->elems[0];
++        urls->elems[0] = tmp;
++    }
++}
+
+-            if (!val) {
+-                av_log(s, AV_LOG_WARNING, "parse_manifest_segmenttimeline attr->name = %s val is NULL\n", attr->name);
++static int dash_subdemuxer_read(void *opaque, uint8_t *buf, int buf_size)
++{
++    int ret;
++    DASHRepresentation *rep = opaque;
++    AVFormatContext *s = rep->oc;
++    DASHContext *c = s->priv_data;
++    int size;
++    unsigned seg = rep->cur_segment;
++
++open_segment:;
++    do {
++        DASHRepresentationPeriod *period;
++        char *url;
++        const char *base;
++        const char *template;
++        uint64_t $Number$;
++        int64_t $Time$;
++        DASHRange range;
++        AVDictionary *opts;
++#if CONFIG_HTTP_PROTOCOL
++        URLContext *uc;
++#endif
++
++        if (rep->segments[seg].pb &&
++            !rep->segments[seg].pb->eof_reached)
++            continue;
++
++        for (unsigned i = 0; i < rep->nb_periods; ++i) {
++            int64_t period_ts;
++            DASHTimeline *timeline;
++
++            period = rep->periods[i];
++            timeline = period->timeline;
++
++            /* Check if we are inside Period boundaries. */
++            if (!(period->period->start_ts <= rep->read_ts &&
++                                              rep->read_ts < period->period->end_ts))
+                 continue;
+-            }
+
+-            if (!av_strcasecmp(attr->name, "t")) {
+-                tml->starttime = (int64_t)strtoll(val, NULL, 10);
+-            } else if (!av_strcasecmp(attr->name, "r")) {
+-                tml->repeat =(int64_t) strtoll(val, NULL, 10);
+-            } else if (!av_strcasecmp(attr->name, "d")) {
+-                tml->duration = (int64_t)strtoll(val, NULL, 10);
+-            }
+-            attr = attr->next;
+-            xmlFree(val);
+-        }
+-        err = av_dynarray_add_nofree(&rep->timelines, &rep->n_timelines, tml);
+-        if (err < 0) {
+-            av_free(tml);
+-            return err;
+-        }
+-    }
++            /* period_ts := read_ts relative to Period start. */
++            period_ts = av_rescale_q_rnd(rep->read_ts - period->period->start_ts,
++                                         AV_TIME_BASE_Q,
++                                         (AVRational){ 1, timeline->timescale },
++                                         AV_ROUND_UP);
+
+-    return 0;
+-}
++            if (timeline->type == TIMELINE_TEMPLATES) {
++                for (unsigned j = 0; j < timeline->u.templates.nb; ++j) {
++                    DASHSegmentTemplate *g = &timeline->u.templates.elems[j];
++                    int64_t end_time = g->repeat < 0 || INT64_MAX / (g->repeat + 1) < g->duration
++                        ? INT64_MAX
++                        : g->start_ts + g->duration * (g->repeat + 1);
++                    end_time = FFMIN(end_time, timeline->duration);
+
+-static int resolve_content_path(AVFormatContext *s, const char *url, int *max_url_size, xmlNodePtr *baseurl_nodes, int n_baseurl_nodes)
+-{
+-    char *tmp_str = NULL;
+-    char *path = NULL;
+-    char *mpdName = NULL;
+-    xmlNodePtr node = NULL;
+-    char *baseurl = NULL;
+-    char *root_url = NULL;
+-    char *text = NULL;
+-    char *tmp = NULL;
+-    int isRootHttp = 0;
+-    char token ='/';
+-    int start =  0;
+-    int rootId = 0;
+-    int updated = 0;
+-    int size = 0;
+-    int i;
+-    int tmp_max_url_size = strlen(url);
++                    if (period_ts < g->start_ts) {
++                        /* Gap detected: Missing segments in timeline. */
++                    }
+
+-    for (i = n_baseurl_nodes-1; i >= 0 ; i--) {
+-        text = xmlNodeGetContent(baseurl_nodes[i]);
+-        if (!text)
+-            continue;
+-        tmp_max_url_size += strlen(text);
+-        if (ishttp(text)) {
+-            xmlFree(text);
+-            break;
+-        }
+-        xmlFree(text);
+-    }
++                    if (period_ts < end_time) {
++#if 0
++                        av_log(rep->oc, AV_LOG_TRACE, "S@[n=%"PRId64" d*r=%"PRId64"*%"PRId64"]: %"PRId64" <= %"PRId64" <= %"PRId64"?\n",
++                               g->number, g->duration, g->repeat, g->start_ts, period_ts, end_time);
++#endif
+
+-    tmp_max_url_size = aligned(tmp_max_url_size);
+-    text = av_mallocz(tmp_max_url_size);
+-    if (!text) {
+-        updated = AVERROR(ENOMEM);
+-        goto end;
+-    }
+-    av_strlcpy(text, url, strlen(url)+1);
+-    tmp = text;
+-    while (mpdName = av_strtok(tmp, "/", &tmp))  {
+-        size = strlen(mpdName);
+-    }
+-    av_free(text);
++                        /* If period changed push init section first. */
++                        if (rep->cur_period != period) {
++                            if (seg != rep->cur_segment)
++                                goto read_segment;
+
+-    path = av_mallocz(tmp_max_url_size);
+-    tmp_str = av_mallocz(tmp_max_url_size);
+-    if (!tmp_str || !path) {
+-        updated = AVERROR(ENOMEM);
+-        goto end;
+-    }
++                            if (!rep->save_init) {
++                                rep->save_init = 1;
+
+-    av_strlcpy (path, url, strlen(url) - size + 1);
+-    for (rootId = n_baseurl_nodes - 1; rootId > 0; rootId --) {
+-        if (!(node = baseurl_nodes[rootId])) {
+-            continue;
+-        }
+-        text = xmlNodeGetContent(node);
+-        if (ishttp(text)) {
+-            xmlFree(text);
+-            break;
+-        }
+-        xmlFree(text);
+-    }
++                                /* Send out stored part. */
++                                if (0 < period->initbuf_size) {
++                                    memcpy(buf, period->initbuf, period->initbuf_size);
++                                    return period->initbuf_size;
++                                }
++                            }
+
+-    node = baseurl_nodes[rootId];
+-    baseurl = xmlNodeGetContent(node);
+-    root_url = (av_strcasecmp(baseurl, "")) ? baseurl : path;
+-    if (node) {
+-        xmlNodeSetContent(node, root_url);
+-        updated = 1;
+-    }
++                            rep->cur_period = period;
++                            ret = dash_subdemuxer_update(rep);
++                            if (ret < 0)
++                                return ret;
+
+-    size = strlen(root_url);
+-    isRootHttp = ishttp(root_url);
++                            range = timeline->init.range;
++                            range.start += period->initbuf_size;
+
+-    if (size > 0 && root_url[size - 1] != token) {
+-        av_strlcat(root_url, "/", size + 2);
+-        size += 2;
+-    }
++                            /* Test whether full segment is stored and thus
++                             * previously has been sent out. */
++                            if (0 < period->initbuf_size &&
++                                (period->initbuf_size < INITBUF_MAX ||
++                                 range.end <= range.start))
++                            {
++                                rep->save_init = 0;
++                                continue;
++                            }
+
+-    for (i = 0; i < n_baseurl_nodes; ++i) {
+-        if (i == rootId) {
+-            continue;
+-        }
+-        text = xmlNodeGetContent(baseurl_nodes[i]);
+-        if (text && !av_strstart(text, "/", NULL)) {
+-            memset(tmp_str, 0, strlen(tmp_str));
+-            if (!ishttp(text) && isRootHttp) {
+-                av_strlcpy(tmp_str, root_url, size + 1);
+-            }
+-            start = (text[0] == token);
+-            if (start && av_stristr(tmp_str, text)) {
+-                char *p = tmp_str;
+-                if (!av_strncasecmp(tmp_str, "http://", 7)) {
+-                    p += 7;
+-                } else if (!av_strncasecmp(tmp_str, "https://", 8)) {
+-                    p += 8;
++                            $Time$ = 0, $Number$ = 0; /* They should not be used in template URL. */
++                            template = timeline->init.url;
++                        } else {
++                            uint64_t r = (period_ts - g->start_ts) / g->duration;
++                            $Time$ = g->start_ts + g->duration * r;
++                            $Number$ = g->number + r;
++                            template = timeline->u.templates.master.url;
++                            range = timeline->u.templates.master.range;
++
++                            rep->read_ts = av_rescale_q_rnd($Time$ + g->duration,
++                                                            (AVRational){ 1, timeline->timescale },
++                                                            AV_TIME_BASE_Q,
++                                                            AV_ROUND_UP);
++
++                            /* Wait until segment becomes available. */
++                            if (c->is_live) {
++                                int64_t time_shift = rep->read_ts - c->availability_start_time;
++                                if (time_shift < 0) {
++                                    /* Allow suspending thread only when it is really neccessary, i.e. we have no other segments to serve. */
++                                    if (seg == rep->cur_segment)
++                                        av_usleep(-time_shift);
++                                    else
++                                        goto read_segment;
++                                }
++                            }
++                        }
++                        base = period->base->elems[0];
++
++                        goto found;
++                    }
+                 }
+-                p = strchr(p, '/');
+-                memset(p + 1, 0, strlen(p));
+-            }
+-            av_strlcat(tmp_str, text + start, tmp_max_url_size);
+-            xmlNodeSetContent(baseurl_nodes[i], tmp_str);
+-            updated = 1;
+-            xmlFree(text);
+-        }
+-    }
+-
+-end:
+-    if (tmp_max_url_size > *max_url_size) {
+-        *max_url_size = tmp_max_url_size;
+-    }
+-    av_free(path);
+-    av_free(tmp_str);
+-    xmlFree(baseurl);
+-    return updated;
+-
+-}
+-
+-static int parse_manifest_representation(AVFormatContext *s, const char *url,
+-                                         xmlNodePtr node,
+-                                         xmlNodePtr adaptionset_node,
+-                                         xmlNodePtr mpd_baseurl_node,
+-                                         xmlNodePtr period_baseurl_node,
+-                                         xmlNodePtr period_segmenttemplate_node,
+-                                         xmlNodePtr period_segmentlist_node,
+-                                         xmlNodePtr fragment_template_node,
+-                                         xmlNodePtr content_component_node,
+-                                         xmlNodePtr adaptionset_baseurl_node,
+-                                         xmlNodePtr adaptionset_segmentlist_node,
+-                                         xmlNodePtr adaptionset_supplementalproperty_node)
+-{
+-    int32_t ret = 0;
+-    DASHContext *c = s->priv_data;
+-    struct representation *rep = NULL;
+-    struct fragment *seg = NULL;
+-    xmlNodePtr representation_segmenttemplate_node = NULL;
+-    xmlNodePtr representation_baseurl_node = NULL;
+-    xmlNodePtr representation_segmentlist_node = NULL;
+-    xmlNodePtr segmentlists_tab[3];
+-    xmlNodePtr fragment_timeline_node = NULL;
+-    xmlNodePtr fragment_templates_tab[5];
+-    char *val = NULL;
+-    xmlNodePtr baseurl_nodes[4];
+-    xmlNodePtr representation_node = node;
+-    char *rep_bandwidth_val;
+-    enum AVMediaType type = AVMEDIA_TYPE_UNKNOWN;
+-
+-    // try get information from representation
+-    if (type == AVMEDIA_TYPE_UNKNOWN)
+-        type = get_content_type(representation_node);
+-    // try get information from contentComponen
+-    if (type == AVMEDIA_TYPE_UNKNOWN)
+-        type = get_content_type(content_component_node);
+-    // try get information from adaption set
+-    if (type == AVMEDIA_TYPE_UNKNOWN)
+-        type = get_content_type(adaptionset_node);
+-    if (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO &&
+-        type != AVMEDIA_TYPE_SUBTITLE) {
+-        av_log(s, AV_LOG_VERBOSE, "Parsing '%s' - skipp not supported representation type\n", url);
+-        return 0;
+-    }
+-
+-    // convert selected representation to our internal struct
+-    rep = av_mallocz(sizeof(struct representation));
+-    if (!rep)
+-        return AVERROR(ENOMEM);
+-    if (c->adaptionset_lang) {
+-        rep->lang = av_strdup(c->adaptionset_lang);
+-        if (!rep->lang) {
+-            av_log(s, AV_LOG_ERROR, "alloc language memory failure\n");
+-            av_freep(&rep);
+-            return AVERROR(ENOMEM);
+-        }
+-    }
+-    rep->parent = s;
+-    representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
+-    representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
+-    representation_segmentlist_node = find_child_node_by_name(representation_node, "SegmentList");
+-    rep_bandwidth_val = xmlGetProp(representation_node, "bandwidth");
+-    val               = xmlGetProp(representation_node, "id");
+-    if (val) {
+-        rep->id = av_strdup(val);
+-        xmlFree(val);
+-        if (!rep->id)
+-            goto enomem;
+-    }
+-
+-    baseurl_nodes[0] = mpd_baseurl_node;
+-    baseurl_nodes[1] = period_baseurl_node;
+-    baseurl_nodes[2] = adaptionset_baseurl_node;
+-    baseurl_nodes[3] = representation_baseurl_node;
+-
+-    ret = resolve_content_path(s, url, &c->max_url_size, baseurl_nodes, 4);
+-    c->max_url_size = aligned(c->max_url_size
+-                              + (rep->id ? strlen(rep->id) : 0)
+-                              + (rep_bandwidth_val ? strlen(rep_bandwidth_val) : 0));
+-    if (ret == AVERROR(ENOMEM) || ret == 0)
+-        goto free;
+-    if (representation_segmenttemplate_node || fragment_template_node || period_segmenttemplate_node) {
+-        fragment_timeline_node = NULL;
+-        fragment_templates_tab[0] = representation_segmenttemplate_node;
+-        fragment_templates_tab[1] = adaptionset_segmentlist_node;
+-        fragment_templates_tab[2] = fragment_template_node;
+-        fragment_templates_tab[3] = period_segmenttemplate_node;
+-        fragment_templates_tab[4] = period_segmentlist_node;
+-
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "initialization");
+-        if (val) {
+-            rep->init_section = av_mallocz(sizeof(struct fragment));
+-            if (!rep->init_section) {
+-                xmlFree(val);
+-                goto enomem;
+-            }
+-            c->max_url_size = aligned(c->max_url_size  + strlen(val));
+-            rep->init_section->url = get_content_url(baseurl_nodes, 4,
+-                                                     c->max_url_size, rep->id,
+-                                                     rep_bandwidth_val, val);
+-            xmlFree(val);
+-            if (!rep->init_section->url)
+-                goto enomem;
+-            rep->init_section->size = -1;
+-        }
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "media");
+-        if (val) {
+-            c->max_url_size = aligned(c->max_url_size  + strlen(val));
+-            rep->url_template = get_content_url(baseurl_nodes, 4,
+-                                                c->max_url_size, rep->id,
+-                                                rep_bandwidth_val, val);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "presentationTimeOffset");
+-        if (val) {
+-            rep->presentation_timeoffset = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->presentation_timeoffset = [%"PRId64"]\n", rep->presentation_timeoffset);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "duration");
+-        if (val) {
+-            rep->fragment_duration = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->fragment_duration = [%"PRId64"]\n", rep->fragment_duration);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "timescale");
+-        if (val) {
+-            rep->fragment_timescale = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->fragment_timescale = [%"PRId64"]\n", rep->fragment_timescale);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(fragment_templates_tab, 4, "startNumber");
+-        if (val) {
+-            rep->start_number = rep->first_seq_no = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->first_seq_no = [%"PRId64"]\n", rep->first_seq_no);
+-            xmlFree(val);
+-        }
+-        if (adaptionset_supplementalproperty_node) {
+-            if (!av_strcasecmp(xmlGetProp(adaptionset_supplementalproperty_node,"schemeIdUri"), "http://dashif.org/guidelines/last-segment-number")) {
+-                val = xmlGetProp(adaptionset_supplementalproperty_node,"value");
+-                if (!val) {
+-                    av_log(s, AV_LOG_ERROR, "Missing value attribute in adaptionset_supplementalproperty_node\n");
++            } else if (timeline->type == TIMELINE_SEGMENTS) {
++                DASHSegment *g;
++
++                if (rep->cur_period != period) {
++                    if (seg != rep->cur_segment)
++                        goto read_segment;
++
++                    rep->cur_period = period;
++                    ret = dash_subdemuxer_update(rep);
++                    if (ret < 0)
++                        return ret;
++
++                    g = &timeline->init;
++                } else if (0 < timeline->u.segments.nb) {
++                    int64_t segment_ts = timeline->duration / timeline->u.segments.nb;
++                    g = &timeline->u.segments.elems[period_ts / segment_ts];
+                 } else {
+-                    rep->last_seq_no =(int64_t) strtoll(val, NULL, 10) - 1;
+-                    xmlFree(val);
++                    /* One segment timeline. */
++                    continue;
+                 }
+-            }
+-        }
+
+-        fragment_timeline_node = find_child_node_by_name(representation_segmenttemplate_node, "SegmentTimeline");
++                base = period->base->elems[0];
++                template = g->url; /* HACK: URL is not template. */
++                range = g->range;
+
+-        if (!fragment_timeline_node)
+-            fragment_timeline_node = find_child_node_by_name(fragment_template_node, "SegmentTimeline");
+-        if (!fragment_timeline_node)
+-            fragment_timeline_node = find_child_node_by_name(adaptionset_segmentlist_node, "SegmentTimeline");
+-        if (!fragment_timeline_node)
+-            fragment_timeline_node = find_child_node_by_name(period_segmentlist_node, "SegmentTimeline");
+-        if (fragment_timeline_node) {
+-            fragment_timeline_node = xmlFirstElementChild(fragment_timeline_node);
+-            while (fragment_timeline_node) {
+-                ret = parse_manifest_segmenttimeline(s, rep, fragment_timeline_node);
+-                if (ret < 0)
+-                    goto free;
+-                fragment_timeline_node = xmlNextElementSibling(fragment_timeline_node);
++                goto found;
++            } else {
++                abort();
+             }
+-        }
+-    } else if (representation_baseurl_node && !representation_segmentlist_node) {
+-        seg = av_mallocz(sizeof(struct fragment));
+-        if (!seg)
+-            goto enomem;
+-        ret = av_dynarray_add_nofree(&rep->fragments, &rep->n_fragments, seg);
+-        if (ret < 0) {
+-            av_free(seg);
+-            goto free;
+-        }
+-        seg->url = get_content_url(baseurl_nodes, 4, c->max_url_size,
+-                                   rep->id, rep_bandwidth_val, NULL);
+-        if (!seg->url)
+-            goto enomem;
+-        seg->size = -1;
+-    } else if (representation_segmentlist_node) {
+-        // TODO: https://www.brendanlong.com/the-structure-of-an-mpeg-dash-mpd.html
+-        // http://www-itec.uni-klu.ac.at/dash/ddash/mpdGenerator.php?fragmentlength=15&type=full
+-        xmlNodePtr fragmenturl_node = NULL;
+-        segmentlists_tab[0] = representation_segmentlist_node;
+-        segmentlists_tab[1] = adaptionset_segmentlist_node;
+-        segmentlists_tab[2] = period_segmentlist_node;
+
+-        val = get_val_from_nodes_tab(segmentlists_tab, 3, "duration");
+-        if (val) {
+-            rep->fragment_duration = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->fragment_duration = [%"PRId64"]\n", rep->fragment_duration);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(segmentlists_tab, 3, "timescale");
+-        if (val) {
+-            rep->fragment_timescale = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->fragment_timescale = [%"PRId64"]\n", rep->fragment_timescale);
+-            xmlFree(val);
+-        }
+-        val = get_val_from_nodes_tab(segmentlists_tab, 3, "startNumber");
+-        if (val) {
+-            rep->start_number = rep->first_seq_no = (int64_t) strtoll(val, NULL, 10);
+-            av_log(s, AV_LOG_TRACE, "rep->first_seq_no = [%"PRId64"]\n", rep->first_seq_no);
+-            xmlFree(val);
+-        }
++            /* Gap detected: No more segments till end of the period. Jump to
++             * the end of the period. */
++            rep->read_ts = period->period->end_ts;
+
+-        fragmenturl_node = xmlFirstElementChild(representation_segmentlist_node);
+-        while (fragmenturl_node) {
+-            ret = parse_manifest_segmenturlnode(s, rep, fragmenturl_node,
+-                                                baseurl_nodes, rep->id,
+-                                                rep_bandwidth_val);
+-            if (ret < 0)
+-                goto free;
+-            fragmenturl_node = xmlNextElementSibling(fragmenturl_node);
++            /* Periods may be out-of-order so start searching next one from the beginning. */
++            i = 0;
+         }
+
+-        fragment_timeline_node = find_child_node_by_name(adaptionset_segmentlist_node, "SegmentTimeline");
+-        if (!fragment_timeline_node)
+-            fragment_timeline_node = find_child_node_by_name(period_segmentlist_node, "SegmentTimeline");
+-        if (fragment_timeline_node) {
+-            fragment_timeline_node = xmlFirstElementChild(fragment_timeline_node);
+-            while (fragment_timeline_node) {
+-                ret = parse_manifest_segmenttimeline(s, rep, fragment_timeline_node);
+-                if (ret < 0)
+-                    goto free;
+-                fragment_timeline_node = xmlNextElementSibling(fragment_timeline_node);
+-            }
+-        }
+-    } else {
+-        av_log(s, AV_LOG_ERROR, "Unknown format of Representation node id '%s' \n",
+-               rep->id ? rep->id : "");
+-        goto free;
+-    }
++        if (seg == rep->cur_segment)
++            return AVERROR_EOF;
++        else
++            goto read_segment;
+
+-    if (rep->fragment_duration > 0 && !rep->fragment_timescale)
+-        rep->fragment_timescale = 1;
+-    rep->bandwidth = rep_bandwidth_val ? atoi(rep_bandwidth_val) : 0;
+-    rep->framerate = av_make_q(0, 0);
+-    if (type == AVMEDIA_TYPE_VIDEO) {
+-        char *rep_framerate_val = xmlGetProp(representation_node, "frameRate");
+-        if (rep_framerate_val) {
+-            ret = av_parse_video_rate(&rep->framerate, rep_framerate_val);
+-            if (ret < 0)
+-                av_log(s, AV_LOG_VERBOSE, "Ignoring invalid frame rate '%s'\n", rep_framerate_val);
+-            xmlFree(rep_framerate_val);
++    found:
++        if (template) {
++            url = dash_make_url(base, template, rep->id, $Number$, $Time$, period->bandwidth);
++            if (!url)
++                return AVERROR(ENOMEM);
++        } else {
++            url = (char *)base;
+         }
+-    }
+-
+-    switch (type) {
+-    case AVMEDIA_TYPE_VIDEO:
+-        ret = av_dynarray_add_nofree(&c->videos, &c->n_videos, rep);
+-        break;
+-    case AVMEDIA_TYPE_AUDIO:
+-        ret = av_dynarray_add_nofree(&c->audios, &c->n_audios, rep);
+-        break;
+-    case AVMEDIA_TYPE_SUBTITLE:
+-        ret = av_dynarray_add_nofree(&c->subtitles, &c->n_subtitles, rep);
+-        break;
+-    }
+-    if (ret < 0)
+-        goto free;
+-
+-end:
+-    if (rep_bandwidth_val)
+-        xmlFree(rep_bandwidth_val);
+
+-    return ret;
+-enomem:
+-    ret = AVERROR(ENOMEM);
+-free:
+-    free_representation(rep);
+-    goto end;
+-}
++        opts = NULL;
+
+-static int parse_manifest_adaptationset_attr(AVFormatContext *s, xmlNodePtr adaptionset_node)
+-{
+-    DASHContext *c = s->priv_data;
++        if (0 < range.start)
++            av_dict_set_int(&opts, "offset", range.start, 0);
+
+-    if (!adaptionset_node) {
+-        av_log(s, AV_LOG_WARNING, "Cannot get AdaptionSet\n");
+-        return AVERROR(EINVAL);
+-    }
+-    c->adaptionset_lang = xmlGetProp(adaptionset_node, "lang");
++        if (range.end < INT64_MAX)
++            av_dict_set_int(&opts, "end_offset", range.end, 0);
+
+-    return 0;
+-}
++        av_dict_set(&opts, "multiple_requests", "1", 0);
++        av_dict_copy(&opts, c->protocol_opts, 0);
+
+-static int parse_manifest_adaptationset(AVFormatContext *s, const char *url,
+-                                        xmlNodePtr adaptionset_node,
+-                                        xmlNodePtr mpd_baseurl_node,
+-                                        xmlNodePtr period_baseurl_node,
+-                                        xmlNodePtr period_segmenttemplate_node,
+-                                        xmlNodePtr period_segmentlist_node)
+-{
+-    int ret = 0;
+-    DASHContext *c = s->priv_data;
+-    xmlNodePtr fragment_template_node = NULL;
+-    xmlNodePtr content_component_node = NULL;
+-    xmlNodePtr adaptionset_baseurl_node = NULL;
+-    xmlNodePtr adaptionset_segmentlist_node = NULL;
+-    xmlNodePtr adaptionset_supplementalproperty_node = NULL;
+-    xmlNodePtr node = NULL;
+-
+-    ret = parse_manifest_adaptationset_attr(s, adaptionset_node);
+-    if (ret < 0)
+-        return ret;
+-
+-    node = xmlFirstElementChild(adaptionset_node);
+-    while (node) {
+-        if (!av_strcasecmp(node->name, "SegmentTemplate")) {
+-            fragment_template_node = node;
+-        } else if (!av_strcasecmp(node->name, "ContentComponent")) {
+-            content_component_node = node;
+-        } else if (!av_strcasecmp(node->name, "BaseURL")) {
+-            adaptionset_baseurl_node = node;
+-        } else if (!av_strcasecmp(node->name, "SegmentList")) {
+-            adaptionset_segmentlist_node = node;
+-        } else if (!av_strcasecmp(node->name, "SupplementalProperty")) {
+-            adaptionset_supplementalproperty_node = node;
+-        } else if (!av_strcasecmp(node->name, "Representation")) {
+-            ret = parse_manifest_representation(s, url, node,
+-                                                adaptionset_node,
+-                                                mpd_baseurl_node,
+-                                                period_baseurl_node,
+-                                                period_segmenttemplate_node,
+-                                                period_segmentlist_node,
+-                                                fragment_template_node,
+-                                                content_component_node,
+-                                                adaptionset_baseurl_node,
+-                                                adaptionset_segmentlist_node,
+-                                                adaptionset_supplementalproperty_node);
+-            if (ret < 0)
+-                goto err;
++#if CONFIG_HTTP_PROTOCOL
++        if (!(uc = ffio_geturlcontext(rep->segments[seg].pb)) ||
++             (rep->segments[seg].pb->eof_reached = 0,
++              rep->segments[seg].pb->pos = 0,
++              (ret = ff_http_do_new_request2(uc, url, &opts)) < 0))
++#endif
++        {
++            ff_format_io_close(s, &rep->segments[seg].pb);
++            ret = s->io_open(s, &rep->segments[seg].pb, url, AVIO_FLAG_READ, &opts);
+         }
+-        node = xmlNextElementSibling(node);
+-    }
+-
+-err:
+-    xmlFree(c->adaptionset_lang);
+-    c->adaptionset_lang = NULL;
+-    return ret;
+-}
+-
+-static int parse_programinformation(AVFormatContext *s, xmlNodePtr node)
+-{
+-    xmlChar *val = NULL;
+-
+-    node = xmlFirstElementChild(node);
+-    while (node) {
+-        if (!av_strcasecmp(node->name, "Title")) {
+-            val = xmlNodeGetContent(node);
+-            if (val) {
+-                av_dict_set(&s->metadata, "Title", val, 0);
+-            }
+-        } else if (!av_strcasecmp(node->name, "Source")) {
+-            val = xmlNodeGetContent(node);
+-            if (val) {
+-                av_dict_set(&s->metadata, "Source", val, 0);
+-            }
+-        } else if (!av_strcasecmp(node->name, "Copyright")) {
+-            val = xmlNodeGetContent(node);
+-            if (val) {
+-                av_dict_set(&s->metadata, "Copyright", val, 0);
+-            }
+-        }
+-        node = xmlNextElementSibling(node);
+-        xmlFree(val);
+-        val = NULL;
+-    }
+-    return 0;
+-}
+-
+-static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
+-{
+-    DASHContext *c = s->priv_data;
+-    int ret = 0;
+-    int close_in = 0;
+-    int64_t filesize = 0;
+-    AVBPrint buf;
+-    AVDictionary *opts = NULL;
+-    xmlDoc *doc = NULL;
+-    xmlNodePtr root_element = NULL;
+-    xmlNodePtr node = NULL;
+-    xmlNodePtr period_node = NULL;
+-    xmlNodePtr tmp_node = NULL;
+-    xmlNodePtr mpd_baseurl_node = NULL;
+-    xmlNodePtr period_baseurl_node = NULL;
+-    xmlNodePtr period_segmenttemplate_node = NULL;
+-    xmlNodePtr period_segmentlist_node = NULL;
+-    xmlNodePtr adaptionset_node = NULL;
+-    xmlAttrPtr attr = NULL;
+-    char *val  = NULL;
+-    uint32_t period_duration_sec = 0;
+-    uint32_t period_start_sec = 0;
+-
+-    if (!in) {
+-        close_in = 1;
+
+-        av_dict_copy(&opts, c->avio_opts, 0);
+-        ret = avio_open2(&in, url, AVIO_FLAG_READ, c->interrupt_callback, &opts);
++        if (template)
++            av_free(url);
+         av_dict_free(&opts);
+-        if (ret < 0)
+-            return ret;
+-    }
+
+-    if (av_opt_get(in, "location", AV_OPT_SEARCH_CHILDREN, (uint8_t**)&c->base_url) < 0)
+-        c->base_url = av_strdup(url);
+-
+-    filesize = avio_size(in);
+-    filesize = filesize > 0 ? filesize : DEFAULT_MANIFEST_SIZE;
+-
+-    if (filesize > MAX_BPRINT_READ_SIZE) {
+-        av_log(s, AV_LOG_ERROR, "Manifest too large: %"PRId64"\n", filesize);
+-        return AVERROR_INVALIDDATA;
+-    }
+-
+-    av_bprint_init(&buf, filesize + 1, AV_BPRINT_SIZE_UNLIMITED);
+-
+-    if ((ret = avio_read_to_bprint(in, &buf, MAX_BPRINT_READ_SIZE)) < 0 ||
+-        !avio_feof(in) ||
+-        (filesize = buf.len) == 0) {
+-        av_log(s, AV_LOG_ERROR, "Unable to read to manifest '%s'\n", url);
+-        if (ret == 0)
+-            ret = AVERROR_INVALIDDATA;
+-    } else {
+-        LIBXML_TEST_VERSION
+-
+-        doc = xmlReadMemory(buf.str, filesize, c->base_url, NULL, 0);
+-        root_element = xmlDocGetRootElement(doc);
+-        node = root_element;
+-
+-        if (!node) {
+-            ret = AVERROR_INVALIDDATA;
+-            av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing root node\n", url);
+-            goto cleanup;
+-        }
+-
+-        if (node->type != XML_ELEMENT_NODE ||
+-            av_strcasecmp(node->name, "MPD")) {
+-            ret = AVERROR_INVALIDDATA;
+-            av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - wrong root node name[%s] type[%d]\n", url, node->name, (int)node->type);
+-            goto cleanup;
+-        }
+-
+-        val = xmlGetProp(node, "type");
+-        if (!val) {
+-            av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing type attrib\n", url);
+-            ret = AVERROR_INVALIDDATA;
+-            goto cleanup;
+-        }
+-        if (!av_strcasecmp(val, "dynamic"))
+-            c->is_live = 1;
+-        xmlFree(val);
+-
+-        attr = node->properties;
+-        while (attr) {
+-            val = xmlGetProp(node, attr->name);
+-
+-            if (!av_strcasecmp(attr->name, "availabilityStartTime")) {
+-                c->availability_start_time = get_utc_date_time_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->availability_start_time = [%"PRId64"]\n", c->availability_start_time);
+-            } else if (!av_strcasecmp(attr->name, "availabilityEndTime")) {
+-                c->availability_end_time = get_utc_date_time_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->availability_end_time = [%"PRId64"]\n", c->availability_end_time);
+-            } else if (!av_strcasecmp(attr->name, "publishTime")) {
+-                c->publish_time = get_utc_date_time_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->publish_time = [%"PRId64"]\n", c->publish_time);
+-            } else if (!av_strcasecmp(attr->name, "minimumUpdatePeriod")) {
+-                c->minimum_update_period = get_duration_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->minimum_update_period = [%"PRId64"]\n", c->minimum_update_period);
+-            } else if (!av_strcasecmp(attr->name, "timeShiftBufferDepth")) {
+-                c->time_shift_buffer_depth = get_duration_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->time_shift_buffer_depth = [%"PRId64"]\n", c->time_shift_buffer_depth);
+-            } else if (!av_strcasecmp(attr->name, "minBufferTime")) {
+-                c->min_buffer_time = get_duration_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->min_buffer_time = [%"PRId64"]\n", c->min_buffer_time);
+-            } else if (!av_strcasecmp(attr->name, "suggestedPresentationDelay")) {
+-                c->suggested_presentation_delay = get_duration_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->suggested_presentation_delay = [%"PRId64"]\n", c->suggested_presentation_delay);
+-            } else if (!av_strcasecmp(attr->name, "mediaPresentationDuration")) {
+-                c->media_presentation_duration = get_duration_insec(s, val);
+-                av_log(s, AV_LOG_TRACE, "c->media_presentation_duration = [%"PRId64"]\n", c->media_presentation_duration);
+-            }
+-            attr = attr->next;
+-            xmlFree(val);
+-        }
+-
+-        tmp_node = find_child_node_by_name(node, "BaseURL");
+-        if (tmp_node) {
+-            mpd_baseurl_node = xmlCopyNode(tmp_node,1);
+-        } else {
+-            mpd_baseurl_node = xmlNewNode(NULL, "BaseURL");
+-        }
+-
+-        // at now we can handle only one period, with the longest duration
+-        node = xmlFirstElementChild(node);
+-        while (node) {
+-            if (!av_strcasecmp(node->name, "Period")) {
+-                period_duration_sec = 0;
+-                period_start_sec = 0;
+-                attr = node->properties;
+-                while (attr) {
+-                    val = xmlGetProp(node, attr->name);
+-                    if (!av_strcasecmp(attr->name, "duration")) {
+-                        period_duration_sec = get_duration_insec(s, val);
+-                    } else if (!av_strcasecmp(attr->name, "start")) {
+-                        period_start_sec    = get_duration_insec(s, val);
+-                    }
+-                    attr = attr->next;
+-                    xmlFree(val);
+-                }
+-                if ((period_duration_sec) >= (c->period_duration)) {
+-                    period_node = node;
+-                    c->period_duration = period_duration_sec;
+-                    c->period_start = period_start_sec;
+-                    if (c->period_start > 0)
+-                        c->media_presentation_duration = c->period_duration;
+-                }
+-            } else if (!av_strcasecmp(node->name, "ProgramInformation")) {
+-                parse_programinformation(s, node);
+-            }
+-            node = xmlNextElementSibling(node);
+-        }
+-        if (!period_node) {
+-            av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing Period node\n", url);
+-            ret = AVERROR_INVALIDDATA;
+-            goto cleanup;
+-        }
+-
+-        adaptionset_node = xmlFirstElementChild(period_node);
+-        while (adaptionset_node) {
+-            if (!av_strcasecmp(adaptionset_node->name, "BaseURL")) {
+-                period_baseurl_node = adaptionset_node;
+-            } else if (!av_strcasecmp(adaptionset_node->name, "SegmentTemplate")) {
+-                period_segmenttemplate_node = adaptionset_node;
+-            } else if (!av_strcasecmp(adaptionset_node->name, "SegmentList")) {
+-                period_segmentlist_node = adaptionset_node;
+-            } else if (!av_strcasecmp(adaptionset_node->name, "AdaptationSet")) {
+-                parse_manifest_adaptationset(s, url, adaptionset_node, mpd_baseurl_node, period_baseurl_node, period_segmenttemplate_node, period_segmentlist_node);
+-            }
+-            adaptionset_node = xmlNextElementSibling(adaptionset_node);
+-        }
+-cleanup:
+-        /*free the document */
+-        xmlFreeDoc(doc);
+-        xmlCleanupParser();
+-        xmlFreeNode(mpd_baseurl_node);
+-    }
+-
+-    av_bprint_finalize(&buf, NULL);
+-    if (close_in) {
+-        avio_close(in);
+-    }
+-    return ret;
+-}
+-
+-static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
+-{
+-    DASHContext *c = s->priv_data;
+-    int64_t num = 0;
+-    int64_t start_time_offset = 0;
+-
+-    if (c->is_live) {
+-        if (pls->n_fragments) {
+-            av_log(s, AV_LOG_TRACE, "in n_fragments mode\n");
+-            num = pls->first_seq_no;
+-        } else if (pls->n_timelines) {
+-            av_log(s, AV_LOG_TRACE, "in n_timelines mode\n");
+-            start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - 60 * pls->fragment_timescale; // 60 seconds before end
+-            num = calc_next_seg_no_from_timelines(pls, start_time_offset);
+-            if (num == -1)
+-                num = pls->first_seq_no;
+-            else
+-                num += pls->first_seq_no;
+-        } else if (pls->fragment_duration){
+-            av_log(s, AV_LOG_TRACE, "in fragment_duration mode fragment_timescale = %"PRId64", presentation_timeoffset = %"PRId64"\n", pls->fragment_timescale, pls->presentation_timeoffset);
+-            if (pls->presentation_timeoffset) {
+-                num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time) * pls->fragment_timescale)-pls->presentation_timeoffset) / pls->fragment_duration - c->min_buffer_time;
+-            } else if (c->publish_time > 0 && !c->availability_start_time) {
+-                if (c->min_buffer_time) {
+-                    num = pls->first_seq_no + (((c->publish_time + pls->fragment_duration) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration - c->min_buffer_time;
+-                } else {
+-                    num = pls->first_seq_no + (((c->publish_time - c->time_shift_buffer_depth + pls->fragment_duration) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
+-                }
+-            } else {
+-                num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
+-            }
+-        }
+-    } else {
+-        num = pls->first_seq_no;
+-    }
+-    return num;
+-}
+-
+-static int64_t calc_min_seg_no(AVFormatContext *s, struct representation *pls)
+-{
+-    DASHContext *c = s->priv_data;
+-    int64_t num = 0;
+-
+-    if (c->is_live && pls->fragment_duration) {
+-        av_log(s, AV_LOG_TRACE, "in live mode\n");
+-        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time) - c->time_shift_buffer_depth) * pls->fragment_timescale) / pls->fragment_duration;
+-    } else {
+-        num = pls->first_seq_no;
+-    }
+-    return num;
+-}
+-
+-static int64_t calc_max_seg_no(struct representation *pls, DASHContext *c)
+-{
+-    int64_t num = 0;
+-
+-    if (pls->n_fragments) {
+-        num = pls->first_seq_no + pls->n_fragments - 1;
+-    } else if (pls->n_timelines) {
+-        int i = 0;
+-        num = pls->first_seq_no + pls->n_timelines - 1;
+-        for (i = 0; i < pls->n_timelines; i++) {
+-            if (pls->timelines[i]->repeat == -1) {
+-                int length_of_each_segment = pls->timelines[i]->duration / pls->fragment_timescale;
+-                num =  c->period_duration / length_of_each_segment;
+-            } else {
+-                num += pls->timelines[i]->repeat;
+-            }
+-        }
+-    } else if (c->is_live && pls->fragment_duration) {
+-        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration;
+-    } else if (pls->fragment_duration) {
+-        num = pls->first_seq_no + (c->media_presentation_duration * pls->fragment_timescale) / pls->fragment_duration;
+-    }
+-
+-    return num;
+-}
+-
+-static void move_timelines(struct representation *rep_src, struct representation *rep_dest, DASHContext *c)
+-{
+-    if (rep_dest && rep_src ) {
+-        free_timelines_list(rep_dest);
+-        rep_dest->timelines    = rep_src->timelines;
+-        rep_dest->n_timelines  = rep_src->n_timelines;
+-        rep_dest->first_seq_no = rep_src->first_seq_no;
+-        rep_dest->last_seq_no = calc_max_seg_no(rep_dest, c);
+-        rep_src->timelines = NULL;
+-        rep_src->n_timelines = 0;
+-        rep_dest->cur_seq_no = rep_src->cur_seq_no;
+-    }
+-}
+-
+-static void move_segments(struct representation *rep_src, struct representation *rep_dest, DASHContext *c)
+-{
+-    if (rep_dest && rep_src ) {
+-        free_fragment_list(rep_dest);
+-        if (rep_src->start_number > (rep_dest->start_number + rep_dest->n_fragments))
+-            rep_dest->cur_seq_no = 0;
+-        else
+-            rep_dest->cur_seq_no += rep_src->start_number - rep_dest->start_number;
+-        rep_dest->fragments    = rep_src->fragments;
+-        rep_dest->n_fragments  = rep_src->n_fragments;
+-        rep_dest->parent  = rep_src->parent;
+-        rep_dest->last_seq_no = calc_max_seg_no(rep_dest, c);
+-        rep_src->fragments = NULL;
+-        rep_src->n_fragments = 0;
+-    }
+-}
+-
+-
+-static int refresh_manifest(AVFormatContext *s)
+-{
+-    int ret = 0, i;
+-    DASHContext *c = s->priv_data;
+-    // save current context
+-    int n_videos = c->n_videos;
+-    struct representation **videos = c->videos;
+-    int n_audios = c->n_audios;
+-    struct representation **audios = c->audios;
+-    int n_subtitles = c->n_subtitles;
+-    struct representation **subtitles = c->subtitles;
+-    char *base_url = c->base_url;
+-
+-    c->base_url = NULL;
+-    c->n_videos = 0;
+-    c->videos = NULL;
+-    c->n_audios = 0;
+-    c->audios = NULL;
+-    c->n_subtitles = 0;
+-    c->subtitles = NULL;
+-    ret = parse_manifest(s, s->url, NULL);
+-    if (ret)
+-        goto finish;
+-
+-    if (c->n_videos != n_videos) {
+-        av_log(c, AV_LOG_ERROR,
+-               "new manifest has mismatched no. of video representations, %d -> %d\n",
+-               n_videos, c->n_videos);
+-        return AVERROR_INVALIDDATA;
+-    }
+-    if (c->n_audios != n_audios) {
+-        av_log(c, AV_LOG_ERROR,
+-               "new manifest has mismatched no. of audio representations, %d -> %d\n",
+-               n_audios, c->n_audios);
+-        return AVERROR_INVALIDDATA;
+-    }
+-    if (c->n_subtitles != n_subtitles) {
+-        av_log(c, AV_LOG_ERROR,
+-               "new manifest has mismatched no. of subtitles representations, %d -> %d\n",
+-               n_subtitles, c->n_subtitles);
+-        return AVERROR_INVALIDDATA;
+-    }
+-
+-    for (i = 0; i < n_videos; i++) {
+-        struct representation *cur_video = videos[i];
+-        struct representation *ccur_video = c->videos[i];
+-        if (cur_video->timelines) {
+-            // calc current time
+-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_video, cur_video->cur_seq_no) / cur_video->fragment_timescale;
+-            // update segments
+-            ccur_video->cur_seq_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1);
+-            if (ccur_video->cur_seq_no >= 0) {
+-                move_timelines(ccur_video, cur_video, c);
+-            }
+-        }
+-        if (cur_video->fragments) {
+-            move_segments(ccur_video, cur_video, c);
+-        }
+-    }
+-    for (i = 0; i < n_audios; i++) {
+-        struct representation *cur_audio = audios[i];
+-        struct representation *ccur_audio = c->audios[i];
+-        if (cur_audio->timelines) {
+-            // calc current time
+-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_audio, cur_audio->cur_seq_no) / cur_audio->fragment_timescale;
+-            // update segments
+-            ccur_audio->cur_seq_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1);
+-            if (ccur_audio->cur_seq_no >= 0) {
+-                move_timelines(ccur_audio, cur_audio, c);
+-            }
+-        }
+-        if (cur_audio->fragments) {
+-            move_segments(ccur_audio, cur_audio, c);
+-        }
+-    }
+-
+-finish:
+-    // restore context
+-    if (c->base_url)
+-        av_free(base_url);
+-    else
+-        c->base_url  = base_url;
+-
+-    if (c->subtitles)
+-        free_subtitle_list(c);
+-    if (c->audios)
+-        free_audio_list(c);
+-    if (c->videos)
+-        free_video_list(c);
+-
+-    c->n_subtitles = n_subtitles;
+-    c->subtitles = subtitles;
+-    c->n_audios = n_audios;
+-    c->audios = audios;
+-    c->n_videos = n_videos;
+-    c->videos = videos;
+-    return ret;
+-}
+-
+-static struct fragment *get_current_fragment(struct representation *pls)
+-{
+-    int64_t min_seq_no = 0;
+-    int64_t max_seq_no = 0;
+-    struct fragment *seg = NULL;
+-    struct fragment *seg_ptr = NULL;
+-    DASHContext *c = pls->parent->priv_data;
+-
+-    while (( !ff_check_interrupt(c->interrupt_callback)&& pls->n_fragments > 0)) {
+-        if (pls->cur_seq_no < pls->n_fragments) {
+-            seg_ptr = pls->fragments[pls->cur_seq_no];
+-            seg = av_mallocz(sizeof(struct fragment));
+-            if (!seg) {
+-                return NULL;
+-            }
+-            seg->url = av_strdup(seg_ptr->url);
+-            if (!seg->url) {
+-                av_free(seg);
+-                return NULL;
+-            }
+-            seg->size = seg_ptr->size;
+-            seg->url_offset = seg_ptr->url_offset;
+-            return seg;
+-        } else if (c->is_live) {
+-            refresh_manifest(pls->parent);
+-        } else {
+-            break;
+-        }
+-    }
+-    if (c->is_live) {
+-        min_seq_no = calc_min_seg_no(pls->parent, pls);
+-        max_seq_no = calc_max_seg_no(pls, c);
+-
+-        if (pls->timelines || pls->fragments) {
+-            refresh_manifest(pls->parent);
+-        }
+-        if (pls->cur_seq_no <= min_seq_no) {
+-            av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+-            pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
+-        } else if (pls->cur_seq_no > max_seq_no) {
+-            av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: min[%"PRId64"] max[%"PRId64"]\n", min_seq_no, max_seq_no);
+-        }
+-        seg = av_mallocz(sizeof(struct fragment));
+-        if (!seg) {
+-            return NULL;
+-        }
+-    } else if (pls->cur_seq_no <= pls->last_seq_no) {
+-        seg = av_mallocz(sizeof(struct fragment));
+-        if (!seg) {
+-            return NULL;
+-        }
+-    }
+-    if (seg) {
+-        char *tmpfilename;
+-        if (!pls->url_template) {
+-            av_log(pls->parent, AV_LOG_ERROR, "Cannot get fragment, missing template URL\n");
+-            av_free(seg);
+-            return NULL;
+-        }
+-        tmpfilename = av_mallocz(c->max_url_size);
+-        if (!tmpfilename) {
+-            av_free(seg);
+-            return NULL;
+-        }
+-        ff_dash_fill_tmpl_params(tmpfilename, c->max_url_size, pls->url_template, 0, pls->cur_seq_no, 0, get_segment_start_time_based_on_timeline(pls, pls->cur_seq_no));
+-        seg->url = av_strireplace(pls->url_template, pls->url_template, tmpfilename);
+-        if (!seg->url) {
+-            av_log(pls->parent, AV_LOG_WARNING, "Unable to resolve template url '%s', try to use origin template\n", pls->url_template);
+-            seg->url = av_strdup(pls->url_template);
+-            if (!seg->url) {
+-                av_log(pls->parent, AV_LOG_ERROR, "Cannot resolve template url '%s'\n", pls->url_template);
+-                av_free(tmpfilename);
+-                av_free(seg);
+-                return NULL;
+-            }
+-        }
+-        av_free(tmpfilename);
+-        seg->size = -1;
+-    }
+-
+-    return seg;
+-}
+-
+-static int read_from_url(struct representation *pls, struct fragment *seg,
+-                         uint8_t *buf, int buf_size)
+-{
+-    int ret;
+-
+-    /* limit read if the fragment was only a part of a file */
+-    if (seg->size >= 0)
+-        buf_size = FFMIN(buf_size, pls->cur_seg_size - pls->cur_seg_offset);
+-
+-    ret = avio_read(pls->input, buf, buf_size);
+-    if (ret > 0)
+-        pls->cur_seg_offset += ret;
+-
+-    return ret;
+-}
+-
+-static int open_input(DASHContext *c, struct representation *pls, struct fragment *seg)
+-{
+-    AVDictionary *opts = NULL;
+-    char *url = NULL;
+-    int ret = 0;
+-
+-    url = av_mallocz(c->max_url_size);
+-    if (!url) {
+-        ret = AVERROR(ENOMEM);
+-        goto cleanup;
+-    }
+-
+-    if (seg->size >= 0) {
+-        /* try to restrict the HTTP request to the part we want
+-         * (if this is in fact a HTTP request) */
+-        av_dict_set_int(&opts, "offset", seg->url_offset, 0);
+-        av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+-    }
+-
+-    ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+-    av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64"\n",
+-           url, seg->url_offset);
+-    ret = open_url(pls->parent, &pls->input, url, &c->avio_opts, opts, NULL);
+-
+-cleanup:
+-    av_free(url);
+-    av_dict_free(&opts);
+-    pls->cur_seg_offset = 0;
+-    pls->cur_seg_size = seg->size;
+-    return ret;
+-}
+-
+-static int update_init_section(struct representation *pls)
+-{
+-    static const int max_init_section_size = 1024 * 1024;
+-    DASHContext *c = pls->parent->priv_data;
+-    int64_t sec_size;
+-    int64_t urlsize;
+-    int ret;
+-
+-    if (!pls->init_section || pls->init_sec_buf)
+-        return 0;
+-
+-    ret = open_input(c, pls, pls->init_section);
+-    if (ret < 0) {
+-        av_log(pls->parent, AV_LOG_WARNING,
+-               "Failed to open an initialization section\n");
+-        return ret;
+-    }
+-
+-    if (pls->init_section->size >= 0)
+-        sec_size = pls->init_section->size;
+-    else if ((urlsize = avio_size(pls->input)) >= 0)
+-        sec_size = urlsize;
+-    else
+-        sec_size = max_init_section_size;
+-
+-    av_log(pls->parent, AV_LOG_DEBUG,
+-           "Downloading an initialization section of size %"PRId64"\n",
+-           sec_size);
+-
+-    sec_size = FFMIN(sec_size, max_init_section_size);
+-
+-    av_fast_malloc(&pls->init_sec_buf, &pls->init_sec_buf_size, sec_size);
+-
+-    ret = read_from_url(pls, pls->init_section, pls->init_sec_buf,
+-                        pls->init_sec_buf_size);
+-    ff_format_io_close(pls->parent, &pls->input);
+-
+-    if (ret < 0)
+-        return ret;
+-
+-    pls->init_sec_data_len = ret;
+-    pls->init_sec_buf_read_offset = 0;
+-
+-    return 0;
+-}
+-
+-static int64_t seek_data(void *opaque, int64_t offset, int whence)
+-{
+-    struct representation *v = opaque;
+-    if (v->n_fragments && !v->init_sec_data_len) {
+-        return avio_seek(v->input, offset, whence);
+-    }
+-
+-    return AVERROR(ENOSYS);
+-}
+-
+-static int read_data(void *opaque, uint8_t *buf, int buf_size)
+-{
+-    int ret = 0;
+-    struct representation *v = opaque;
+-    DASHContext *c = v->parent->priv_data;
+-
+-restart:
+-    if (!v->input) {
+-        free_fragment(&v->cur_seg);
+-        v->cur_seg = get_current_fragment(v);
+-        if (!v->cur_seg) {
+-            ret = AVERROR_EOF;
+-            goto end;
+-        }
+-
+-        /* load/update Media Initialization Section, if any */
+-        ret = update_init_section(v);
+-        if (ret)
+-            goto end;
+-
+-        ret = open_input(c, v, v->cur_seg);
+         if (ret < 0) {
+-            if (ff_check_interrupt(c->interrupt_callback)) {
+-                ret = AVERROR_EXIT;
+-                goto end;
++        fail_segment:
++            if (seg == rep->cur_segment) {
++                /* We know that we have not reached the end. */
++                if (rep->read_ts < period->period->end_ts) {
++                    if (0) {
++                        /* TODO: Implement some failure resistance in case of
++                         * specific HTTP response codes. */
++                        goto open_segment;
++                    } else if (!c->is_live && (ret == AVERROR(ETIMEDOUT) || ret == AVERROR(EIO))) {
++                        /* Allow dropping some segments only for live streams. */
++                        goto open_segment;
++                    }
++                }
++
++                return ret;
++            } else {
++                goto read_segment;
+             }
+-            av_log(v->parent, AV_LOG_WARNING, "Failed to open fragment of playlist\n");
+-            v->cur_seq_no++;
+-            goto restart;
+         }
+-    }
+
+-    if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
+-        /* Push init section out first before first actual fragment */
+-        int copy_size = FFMIN(v->init_sec_data_len - v->init_sec_buf_read_offset, buf_size);
+-        memcpy(buf, v->init_sec_buf, copy_size);
+-        v->init_sec_buf_read_offset += copy_size;
+-        ret = copy_size;
+-        goto end;
+-    }
++        if (0 < range.start &&
++            avio_seek(s->pb, range.start, SEEK_SET) != range.start)
++        {
++            ret = AVERROR(EIO);
++            goto fail_segment;
++        }
+
+-    /* check the v->cur_seg, if it is null, get current and double check if the new v->cur_seg*/
+-    if (!v->cur_seg) {
+-        v->cur_seg = get_current_fragment(v);
+-    }
+-    if (!v->cur_seg) {
+-        ret = AVERROR_EOF;
+-        goto end;
+-    }
+-    ret = read_from_url(v, v->cur_seg, buf, buf_size);
+-    if (ret > 0)
+-        goto end;
++        rep->segments[seg].segment_size = range.end - range.start;
++    } while (rep->cur_segment != (seg = (seg + 1) % c->nb_connections) &&
++             /* Use only a single IO context on startup. */
++             rep->ic->iformat);
++
++read_segment:;
++    /* Only the current segment can be read. */
++    size = FFMIN(buf_size, (int)FFMIN(rep->segments[rep->cur_segment].segment_size, (uint64_t)INT_MAX));
++    av_assert1(0 < size);
++    ret = avio_read_partial(rep->segments[rep->cur_segment].pb, buf, size);
++    if (0 < ret) {
++        rep->segments[rep->cur_segment].segment_size -= ret;
++        if (rep->save_init) {
++            uint8_t *p;
++            /* How much bytes can we store? */
++            int append_size = FFMIN(rep->cur_period->initbuf_size + ret, INITBUF_MAX) -
++                              rep->cur_period->initbuf_size;
+
+-    if (c->is_live || v->cur_seq_no < v->last_seq_no) {
+-        if (!v->is_restart_needed)
+-            v->cur_seq_no++;
+-        v->is_restart_needed = 1;
++            if ((p = av_realloc(rep->cur_period->initbuf, rep->cur_period->initbuf_size + append_size))) {
++                memcpy((rep->cur_period->initbuf = p) + rep->cur_period->initbuf_size, buf, append_size);
++                rep->cur_period->initbuf_size += append_size;
++            } else {
++                /* Do not save anything furthermore otherwise cached init data
++                 * would may be restored with a missing intermediate chunk. */
++                rep->save_init = 0;
++                /* Heck. Reset stored stuff. We can only handle correctly
++                 * received init buffer. */
++                rep->cur_period->initbuf_size = 0;
++            }
++        }
++        return ret;
++    } else if (ret == AVERROR_EOF) {
++        /* Go to next segment. */
++        rep->cur_segment = (rep->cur_segment + 1) % c->nb_connections;
++        rep->save_init = 0;
++    } else if (ret == AVERROR(ETIMEDOUT)) {
++        dash_rotate_urllist(s, rep->cur_period->base);
++    } else if (ret == 0) {
++        if (s->flags & AVFMT_FLAG_NONBLOCK) {
++            return AVERROR(EAGAIN);
++        } else {
++            av_usleep(150 * MILLISEC_PER_SEC);
++            goto read_segment;
++        }
++    } else {
++        return ret;
+     }
+
+-end:
+-    return ret;
++    goto open_segment;
+ }
+
+-static int save_avio_options(AVFormatContext *s)
++static av_cold int dash_subdemuxer_block_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
++                                                 int flags, AVDictionary **opts)
+ {
+     DASHContext *c = s->priv_data;
+-    const char *opts[] = {
+-        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", NULL };
+-    const char **opt = opts;
+-    uint8_t *buf = NULL;
+-    int ret = 0;
+-
+-    while (*opt) {
+-        if (av_opt_get(s->pb, *opt, AV_OPT_SEARCH_CHILDREN, &buf) >= 0) {
+-            if (buf[0] != '\0') {
+-                ret = av_dict_set(&c->avio_opts, *opt, buf, AV_DICT_DONT_STRDUP_VAL);
+-                if (ret < 0)
+-                    return ret;
+-            } else {
+-                av_freep(&buf);
+-            }
+-        }
+-        opt++;
+-    }
+-
+-    return ret;
+-}
+-
+-static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
+-                          int flags, AVDictionary **opts)
+-{
+     av_log(s, AV_LOG_ERROR,
+-           "A DASH playlist item '%s' referred to an external file '%s'. "
+-           "Opening this file was forbidden for security reasons\n",
+-           s->url, url);
++           "Opening external resource '%s' from DASH segment '%s' has been blocked for security reasons",
++           url, c->location);
++    av_log(s, AV_LOG_VERBOSE,
++           "To avoid this security guard open MPD manifest using file: protocol");
+     return AVERROR(EPERM);
+ }
+
+-static void close_demux_for_component(struct representation *pls)
+-{
+-    /* note: the internal buffer could have changed */
+-    av_freep(&pls->pb.buffer);
+-    memset(&pls->pb, 0x00, sizeof(AVIOContext));
+-    pls->ctx->pb = NULL;
+-    avformat_close_input(&pls->ctx);
+-}
+-
+-static int reopen_demux_for_component(AVFormatContext *s, struct representation *pls)
++static av_cold int dash_subdemuxer_alloc(DASHRepresentation *rep)
+ {
++    int ret = 0;
++    AVFormatContext *s = rep->oc;
+     DASHContext *c = s->priv_data;
+-    ff_const59 AVInputFormat *in_fmt = NULL;
+-    AVDictionary  *in_fmt_opts = NULL;
+-    uint8_t *avio_ctx_buffer  = NULL;
+-    int ret = 0, i;
++    uint8_t *buf;
++    int buf_size;
+
+-    if (pls->ctx) {
+-        close_demux_for_component(pls);
+-    }
++    dash_subdemuxer_close(rep);
+
+-    if (ff_check_interrupt(&s->interrupt_callback)) {
+-        ret = AVERROR_EXIT;
+-        goto fail;
+-    }
++    /* Allocate space that is enough for the theoretically largest segment. */
++    buf_size = rep->periods[0]->bandwidth * c->max_segment_duration / AV_TIME_BASE;
++    /* When maximum is not enough. */
++    buf_size += buf_size / 16 /* +~5% */;
++    buf_size = FFMIN(FFMAX(buf_size, 4 * 1024), 256 * 1024);
+
+-    if (!(pls->ctx = avformat_alloc_context())) {
++    if (!(buf = av_malloc(buf_size + AV_INPUT_BUFFER_PADDING_SIZE))) {
+         ret = AVERROR(ENOMEM);
+-        goto fail;
++        goto out;
+     }
+
+-    avio_ctx_buffer  = av_malloc(INITIAL_BUFFER_SIZE);
+-    if (!avio_ctx_buffer ) {
+-        ret = AVERROR(ENOMEM);
+-        avformat_free_context(pls->ctx);
+-        pls->ctx = NULL;
+-        goto fail;
+-    }
+-    ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
+-                      pls, read_data, NULL, c->is_live ? NULL : seek_data);
+-    pls->pb.seekable = 0;
+-
+-    if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0)
+-        goto fail;
+-
+-    pls->ctx->flags = AVFMT_FLAG_CUSTOM_IO;
+-    pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
+-    pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
+-    pls->ctx->interrupt_callback = s->interrupt_callback;
+-    ret = av_probe_input_buffer(&pls->pb, &in_fmt, "", NULL, 0, 0);
+-    if (ret < 0) {
+-        av_log(s, AV_LOG_ERROR, "Error when loading first fragment of playlist\n");
+-        avformat_free_context(pls->ctx);
+-        pls->ctx = NULL;
+-        goto fail;
++    if ((ret = ffio_init_context(&rep->ic_pb, buf, buf_size, 0, rep,
++                                 dash_subdemuxer_read, NULL, dash_subdemuxer_seek) < 0))
++    {
++        /* Note: We purposely do not free I/O buffer since documentation says
++         * nothing about it. We presume inputs are freed on error. Just like in
++         * case av_dict_set() and avformat_alloc_context()... */
++        goto out;
+     }
++    rep->ic_pb.seekable = 0;
+
+-    pls->ctx->pb = &pls->pb;
+-    pls->ctx->io_open  = nested_io_open;
++    /* Padding bytes must be zeroed out. */
++    memset(buf + buf_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+-    // provide additional information from mpd if available
+-    ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
+-    av_dict_free(&in_fmt_opts);
+-    if (ret < 0)
+-        goto fail;
+-    if (pls->n_fragments) {
+-#if FF_API_R_FRAME_RATE
+-        if (pls->framerate.den) {
+-            for (i = 0; i < pls->ctx->nb_streams; i++)
+-                pls->ctx->streams[i]->r_frame_rate = pls->framerate;
+-        }
+-#endif
+-        ret = avformat_find_stream_info(pls->ctx, NULL);
+-        if (ret < 0)
+-            goto fail;
++    if (!(rep->ic = avformat_alloc_context())) {
++        ret = AVERROR(ENOMEM);
++        goto out;
+     }
+
+-fail:
++    rep->ic->pb = &rep->ic_pb;
++    rep->ic->interrupt_callback = s->interrupt_callback;
++
++    rep->ic->probesize = 0 < s->probesize
++        ? s->probesize
++        : 4 * 1024;
++    rep->ic->max_analyze_duration = 0 < s->max_analyze_duration
++        ? s->max_analyze_duration
++        : 4 * AV_TIME_BASE;
++
++    /* We supply everything for the demuxer so normall it should not need to
++     * open anything. Apply this restriction unless we use "file" protocol. */
++    if (strcmp(avio_find_protocol_name(s->url), "file"))
++        rep->ic->io_open = dash_subdemuxer_block_io_open;
++
++    if ((ret = ff_copy_whiteblacklists(rep->ic, s)) < 0)
++        goto out;
++
++out:
++    if (ret < 0)
++        dash_subdemuxer_close(rep);
+     return ret;
+ }
+
+-static int open_demux_for_component(AVFormatContext *s, struct representation *pls)
++/**
++ * Open the real context.
++ */
++static av_cold int dash_subdemuxer_open(DASHRepresentation *rep)
+ {
+     int ret = 0;
+-    int i;
++    AVFormatContext *s = rep->oc;
++    AVInputFormat *iformat = NULL;
+
+-    pls->parent = s;
+-    pls->cur_seq_no  = calc_cur_seg_no(s, pls);
++    av_log(s, AV_LOG_DEBUG, "Opening representation '%s'\n", rep->id);
+
+-    if (!pls->last_seq_no) {
+-        pls->last_seq_no = calc_max_seg_no(pls, s->priv_data);
+-    }
++    if ((ret = dash_subdemuxer_alloc(rep)) < 0)
++        goto out;
+
+-    ret = reopen_demux_for_component(s, pls);
+-    if (ret < 0) {
+-        goto fail;
+-    }
+-    for (i = 0; i < pls->ctx->nb_streams; i++) {
+-        AVStream *st = avformat_new_stream(s, NULL);
+-        AVStream *ist = pls->ctx->streams[i];
+-        if (!st) {
+-            ret = AVERROR(ENOMEM);
+-            goto fail;
+-        }
+-        st->id = i;
+-        avcodec_parameters_copy(st->codecpar, ist->codecpar);
+-        avpriv_set_pts_info(st, ist->pts_wrap_bits, ist->time_base.num, ist->time_base.den);
+-
+-        // copy disposition
+-        st->disposition = ist->disposition;
+-
+-        // copy side data
+-        for (int i = 0; i < ist->nb_side_data; i++) {
+-            const AVPacketSideData *sd_src = &ist->side_data[i];
+-            uint8_t *dst_data;
+-
+-            dst_data = av_stream_new_side_data(st, sd_src->type, sd_src->size);
+-            if (!dst_data)
+-                return AVERROR(ENOMEM);
+-            memcpy(dst_data, sd_src->data, sd_src->size);
+-        }
++    if ((ret = av_probe_input_buffer(&rep->ic_pb, &iformat, NULL, NULL, 0, 0)) < 0) {
++        av_log(s, AV_LOG_ERROR, "Probe failed for representation '%s'\n", rep->id);
++        goto out;
+     }
+
+-    return 0;
+-fail:
++    if ((ret = avformat_open_input(&rep->ic, NULL, iformat, NULL)) < 0)
++        goto out;
++
++    /* Finding stream information may need some essential information, like
++     * encryption init info so stream metadata must be updated before. */
++    if ((ret = dash_subdemuxer_update(rep)))
++        goto out;
++
++    if ((ret = avformat_find_stream_info(rep->ic, NULL)) < 0)
++        goto out;
++
++    /* Though new streams may have been created we do not care about them now.
++     * If this is the case or stream information otherwise changed it will get
++     * updated after reading frames. */
++
++out:
++    if (ret < 0)
++        dash_subdemuxer_close(rep);
+     return ret;
+ }
+
+-static int is_common_init_section_exist(struct representation **pls, int n_pls)
++static av_cold int dash_subdemuxer_init(DASHRepresentation *rep)
+ {
+-    struct fragment *first_init_section = pls[0]->init_section;
+-    char *url =NULL;
+-    int64_t url_offset = -1;
+-    int64_t size = -1;
+-    int i = 0;
+-
+-    if (first_init_section == NULL || n_pls == 0)
+-        return 0;
+-
+-    url = first_init_section->url;
+-    url_offset = first_init_section->url_offset;
+-    size = pls[0]->init_section->size;
+-    for (i=0;i<n_pls;i++) {
+-        if (!pls[i]->init_section)
+-            continue;
+-
+-        if (av_strcasecmp(pls[i]->init_section->url, url) ||
+-            pls[i]->init_section->url_offset != url_offset ||
+-            pls[i]->init_section->size != size) {
+-            return 0;
+-        }
++    int ret;
++    AVFormatContext *s = rep->oc;
++    DASHContext *c = s->priv_data;
++
++    if (c->is_live)
++        rep->read_ts = av_gettime() - FFMIN(10, c->time_shift_buffer_depth) * MICROSEC_PER_SEC;
++    else
++        rep->read_ts = c->start_ts;
++
++    /* Create an inital stream for this representation though we do not what is
++     * really inside. We expect it to be an elementary stream however it do not
++     * have to be always true. In such cases the new streams will appear in
++     * dash_subdemuxer_open(). */
++    if (!avformat_new_stream(rep->ic, NULL)) {
++        ret = AVERROR(ENOMEM);
++        goto out;
+     }
+-    return 1;
++
++    if ((ret = dash_subdemuxer_update(rep)) < 0)
++        goto out;
++
++out:
++    if (ret < 0)
++        dash_subdemuxer_close(rep);
++    return ret;
+ }
+
+-static int copy_init_section(struct representation *rep_dest, struct representation *rep_src)
++static void *av_push_array(void *plist, unsigned elem_size)
+ {
+-    rep_dest->init_sec_buf = av_mallocz(rep_src->init_sec_buf_size);
+-    if (!rep_dest->init_sec_buf) {
+-        av_log(rep_dest->ctx, AV_LOG_WARNING, "Cannot alloc memory for init_sec_buf\n");
+-        return AVERROR(ENOMEM);
+-    }
+-    memcpy(rep_dest->init_sec_buf, rep_src->init_sec_buf, rep_src->init_sec_data_len);
+-    rep_dest->init_sec_buf_size = rep_src->init_sec_buf_size;
+-    rep_dest->init_sec_data_len = rep_src->init_sec_data_len;
+-    rep_dest->cur_timestamp = rep_src->cur_timestamp;
++    void *p;
++    unsigned *nmemb = (unsigned *)((void **)plist + 1);
+
+-    return 0;
+-}
++    if (!(p = av_realloc(*(void **)plist, (*nmemb + 1) * sizeof(void *))))
++        return NULL;
++    *(void **)plist = p;
+
+-static int dash_close(AVFormatContext *s);
++    return ((*(void ***)plist)[(*nmemb)++] = av_mallocz(elem_size));
++}
+
+-static void move_metadata(AVStream *st, const char *key, char **value)
++static av_cold void *dash_find_by_id(AVFormatContext *s, void *list, unsigned nmemb, const char *id)
+ {
+-    if (*value) {
+-        av_dict_set(&st->metadata, key, *value, AV_DICT_DONT_STRDUP_VAL);
+-        *value = NULL;
++    if (!id)
++        return NULL;
++
++    for (unsigned i = 0; i < nmemb; ++i) {
++        void *elem = ((void **)list)[i];
++        xmlChar *elem_id = *(xmlChar **)elem;
++        if (elem_id && !strcmp(elem_id, id))
++            return elem;
+     }
++
++    return NULL;
+ }
+
+-static int dash_read_header(AVFormatContext *s)
++static av_cold int dash_push_id_node(AVFormatContext *s, void *elem, void *plist, unsigned elem_size, xmlNodePtr node)
+ {
+-    DASHContext *c = s->priv_data;
+-    struct representation *rep;
+-    AVProgram *program;
+-    int ret = 0;
+-    int stream_index = 0;
+-    int i;
+-
+-    c->interrupt_callback = &s->interrupt_callback;
+-
+-    if ((ret = save_avio_options(s)) < 0)
+-        goto fail;
+-
+-    if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
+-        goto fail;
+-
+-    /* If this isn't a live stream, fill the total duration of the
+-     * stream. */
+-    if (!c->is_live) {
+-        s->duration = (int64_t) c->media_presentation_duration * AV_TIME_BASE;
++    int ret;
++    xmlChar *id = xmlGetNoNsProp(node, "id");
++    unsigned *nmemb = (unsigned *)((void **)plist + 1);
++
++    if ((*(void **)elem = dash_find_by_id(s, *(void ***)plist, *nmemb, id))) {
++        ret = 1;
++    } else if ((*(void **)elem = av_push_array(plist, elem_size))) {
++        *(xmlChar **)(*(void **)elem) = id;
++        id = NULL;
++        ret = 0;
+     } else {
+-        av_dict_set(&c->avio_opts, "seekable", "0", 0);
++        ret = AVERROR(ENOMEM);
+     }
+
+-    if(c->n_videos)
+-        c->is_init_section_common_video = is_common_init_section_exist(c->videos, c->n_videos);
++    xml_free(id);
++    return ret;
++}
+
+-    /* Open the demuxer for video and audio components if available */
+-    for (i = 0; i < c->n_videos; i++) {
+-        rep = c->videos[i];
+-        if (i > 0 && c->is_init_section_common_video) {
+-            ret = copy_init_section(rep, c->videos[0]);
+-            if (ret < 0)
+-                goto fail;
+-        }
+-        ret = open_demux_for_component(s, rep);
++static int dash_parse_representation(AVFormatContext *s,
++                                     DASHPeriod *period,
++                                     DASHAdaptationSet *as,
++                                     DASHURLList *base_urls,
++                                     DASHTimeline *inherited_timeline,
++                                     const DASHParameters *inherited_par,
++                                     xmlNodePtr node)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHURLList *urls = dash_ref_urllist(base_urls);
++    DASHRepresentation *rep;
++    DASHRepresentationPeriod *rep_period;
++    DASHTimeline *timeline = NULL;
++    int64_t availability_time_offset = 0;
++
++    if ((ret = dash_push_id_node(s, &rep, &c->reps, offsetof(DASHRepresentation, segments[c->nb_connections]), node)) < 0)
++        goto out;
++    else if (!ret) {
++        rep->oc = s;
++    }
++
++    if (!(rep_period = av_push_array(&rep->periods, sizeof(DASHRepresentationPeriod)))) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++
++    rep_period->period = period;
++    rep_period->par = *inherited_par;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "availabilityTimeOffset"))
++            (void)av_sscanf(value, "%"SCNd64, &availability_time_offset);
++        else if (!strcmp(attr->name, "bandwidth"))
++            (void)av_sscanf(value, "%"SCNu32, &rep_period->bandwidth);
++        else if (!dash_parse_parameters(s, &rep_period->par, attr, value))
++            /* Already done. */;
++        else if (!strcmp(attr->name, "startWithSAP") && !strcmp(value, "1"))
++            /* Just check. */;
++        else if (strcmp(attr->name, "id"))
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    xml_for_each_child {
++        if (!strcmp(child->name, "BaseURL"))
++            ret = dash_parse_baseurl(s, &urls, child);
++        else if (!strcmp(child->name, "SegmentTemplate"))
++            ret = dash_parse_segmenttemplate(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentList"))
++            ret = dash_parse_segmentlist(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentBase"))
++            ret = dash_parse_segmentbase(s, period, &timeline, child);
++        else if (!strcmp(child->name, "AudioChannelConfiguration"))
++            ret = dash_parse_audiochannelconfiguration(s, &rep_period->par, child);
++        else if (!strcmp(child->name, "UTCTiming"))
++            ret = dash_parse_utctiming(s, child);
++        else
++            dash_log_unknown_child(s, child);
++
++        if (ret < 0)
++            goto out;
++    }
++
++    rep_period->as = as;
++    if (!timeline && inherited_timeline)
++        timeline = dash_ref_timeline(inherited_timeline);
++    /* Default timeline with one big segment. URL is obtained from BaseURLs. */
++    if (!timeline && (timeline = av_mallocz(sizeof(DASHTimeline)))) {
++        dash_ref_timeline(timeline);
++        timeline->type = TIMELINE_SEGMENTS;
++        timeline->duration = INT64_MAX;
++        timeline->init.range = DASH_RANGE_INITALIZER;
++    }
++    if (!timeline) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    rep_period->base = dash_ref_urllist(urls);
++    rep_period->timeline = dash_ref_timeline(timeline);
++
++    if ((ret = dash_subdemuxer_alloc(rep)) < 0 ||
++        (ret = dash_subdemuxer_init(rep)) < 0)
++    {
++        av_log(s, AV_LOG_DEBUG, "Failed to initalize subdemuxer for representation '%s': %s\n",
++               rep->id, av_err2str(ret));
++        goto out;
++    }
++
++out:
++    dash_unref_timeline(timeline);
++    dash_unref_urllist(urls);
++    return ret;
++}
++
++static av_cold int dash_parse_label(AVFormatContext *s,
++                                    DASHAdaptationSet *as,
++                                    xmlNodePtr node)
++{
++    xmlChar *lang = NULL;
++    xmlChar *value;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "lang")) {
++            lang = value;
++            value = NULL;
++        } else
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    if ((value = xmlNodeGetContent(node)) && *value) {
++        char key_lang[100];
++        if (lang)
++            sprintf(key_lang, "label-%s", lang);
++        av_dict_set(&s->metadata, lang ? key_lang : "label", value, 0);
++    }
++
++    xml_free(value);
++    xml_free(lang);
++    return 0;
++}
++
++static av_cold int dash_parse_adaptationset(AVFormatContext *s,
++                                            DASHPeriod *period,
++                                            DASHURLList *base_urls,
++                                            DASHTimeline *inherited_timeline,
++                                            const DASHParameters *inherited_par,
++                                            xmlNodePtr node)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHContentProtection cp = DASH_CONTENTPROTECTION_INITIALIZER;
++    DASHURLList *urls = dash_ref_urllist(base_urls);
++    DASHAdaptationSet *as;
++    DASHTimeline *timeline = NULL;
++    DASHParameters par = *inherited_par;
++
++    if ((ret = dash_push_id_node(s, &as, &c->ass, sizeof(DASHAdaptationSet), node)) < 0)
++        goto out;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "lang"))
++            av_dict_set(&as->metadata, "language", value, 0);
++        else if (!strcmp(attr->name, "selectionPriority"))
++            av_dict_set(&as->metadata, "priority", value, 0);
++        else if (!strcmp(attr->name, "group"))
++            av_dict_set(&as->metadata, "group", value, 0);
++        else if (!dash_parse_parameters(s, &par, attr, value))
++            /* Already done. */;
++        else if (!strcmp(attr->name, "segmentAlignment") && !strcmp(value, "true"))
++            /* Just check. */;
++        else if (!strcmp(attr->name, "startWithSAP") && !strcmp(value, "1"))
++            /* Just check. */;
++        else if (strcmp(attr->name, "id") &&
++                 strncmp(attr->name, "max", 3) &&
++                 strncmp(attr->name, "min", 3))
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    xml_for_each_child {
++        if (!strcmp(child->name, "SegmentTemplate"))
++            ret = dash_parse_segmenttemplate(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentList"))
++            ret = dash_parse_segmentlist(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentBase"))
++            ret = dash_parse_segmentbase(s, period, &timeline, child);
++        else if (!strcmp(child->name, "ContentProtection"))
++            ret = dash_parse_contentprotection(s, as, &cp, child);
++        else if (!strcmp(child->name, "BaseURL"))
++            ret = dash_parse_baseurl(s, &urls, child);
++        else if (!strcmp(child->name, "Role"))
++            ret = dash_parse_role(s, &par, child);
++        else if (!strcmp(child->name, "Viewpoint"))
++            ret = dash_parse_viewpoint(s, as, child);
++        else if (!strcmp(child->name, "SupplementalProperty") ||
++                 !strcmp(child->name, "EssentialProperty"))
++            ret = dash_parse_property(s, as, NULL, child);
++        else if (!strcmp(child->name, "Representation"))
++            ret = dash_parse_representation(s, period, as, urls, (timeline ? timeline : inherited_timeline), &par, child);
++        else if (!strcmp(child->name, "AudioChannelConfiguration"))
++            ret = dash_parse_audiochannelconfiguration(s, &par, child);
++        else if (!strcmp(child->name, "Label"))
++            ret = dash_parse_label(s, as, child);
++        else
++            dash_log_unknown_child(s, child);
++
++        if (ret < 0)
++            goto out;
++    }
++
++out:
++    dash_unref_timeline(timeline);
++    dash_unref_urllist(urls);
++    return ret;
++}
++
++static av_cold int dash_parse_period(AVFormatContext *s,
++                                     DASHURLList *base_urls,
++                                     xmlNodePtr node)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHURLList *urls = dash_ref_urllist(base_urls);
++    DASHTimeline *timeline = NULL;
++    DASHPeriod *period;
++    int64_t duration = INT64_MAX;
++    DASHParameters par = DASH_PARAMETERS_INITIALIZER;
++
++    if ((ret = dash_push_id_node(s, &period, &c->periods, sizeof(DASHPeriod), node)) < 0)
++        goto out;
++
++    period->start_ts = 0;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "start"))
++            period->start_ts = dash_parse_duration(value, s);
++        else if (!strcmp(attr->name, "duration"))
++            duration = dash_parse_duration(value, s);
++        else if (!dash_parse_parameters(s, &par, attr, value))
++            /* Already done. */;
++        else if (strcmp(attr->name, "id"))
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    period->start_ts += c->availability_start_time;
++    period->end_ts = period->start_ts < INT64_MAX - duration
++        ? period->start_ts + duration
++        : INT64_MAX;
++    if (c->media_presentation_duration < 0)
++        s->duration = FFMAX(s->duration != AV_NOPTS_VALUE ? s->duration : 0, period->end_ts);
++    period->end_ts = FFMIN(period->end_ts, s->duration != AV_NOPTS_VALUE ? s->duration : 0);
++
++    /* INT64_MAX means infinity, ergo unknown duration. It has to be stored
++     * differently for format. */
++    if (INT64_MAX == s->duration)
++        s->duration = AV_NOPTS_VALUE;
++
++    /* Restrict duration of previous periods. */
++    for (unsigned i = 0; i < c->nb_periods; ++i) {
++        DASHPeriod *per = c->periods[i];
++        if (per->start_ts < period->start_ts)
++            per->end_ts = FFMIN(per->end_ts, period->start_ts);
++    }
+
+-        if (ret)
+-            goto fail;
+-        rep->stream_index = stream_index;
+-        ++stream_index;
++    if (period->end_ts <= period->start_ts) {
++        av_log(s, AV_LOG_DEBUG, "Ignoring empty Period %"PRId64" >= %"PRId64"\n",
++               period->start_ts, period->end_ts);
++        goto out;
+     }
+
+-    if(c->n_audios)
+-        c->is_init_section_common_audio = is_common_init_section_exist(c->audios, c->n_audios);
++    xml_for_each_child {
++        if (!strcmp(child->name, "BaseURL"))
++            ret = dash_parse_baseurl(s, &urls, child);
++        else if (!strcmp(child->name, "SegmentTemplate"))
++            ret = dash_parse_segmenttemplate(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentList"))
++            ret = dash_parse_segmentlist(s, period, &timeline, child);
++        else if (!strcmp(child->name, "SegmentBase"))
++            ret = dash_parse_segmentbase(s, period, &timeline, child);
++        else if (!strcmp(child->name, "AdaptationSet"))
++            ret = dash_parse_adaptationset(s, period, urls, timeline, &par, child);
++        else if (!strcmp(child->name, "AssetIdentifier"))
++            ret = dash_parse_assetidentifier(s, period, child);
++        else
++            dash_log_unknown_child(s, child);
+
+-    for (i = 0; i < c->n_audios; i++) {
+-        rep = c->audios[i];
+-        if (i > 0 && c->is_init_section_common_audio) {
+-            ret = copy_init_section(rep, c->audios[0]);
+-            if (ret < 0)
+-                goto fail;
++        if (ret < 0)
++            goto out;
++    }
++
++out:
++    dash_unref_timeline(timeline);
++    dash_unref_urllist(urls);
++    return ret;
++}
++
++static av_cold int dash_parse_programinformation(AVFormatContext *s, xmlNodePtr node)
++{
++    xmlChar *lang = NULL;
++
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "lang")) {
++            lang = value;
++            value = NULL;
++        } else
++            dash_log_unknown_attr(s, attr, value);
++    }
++
++    xml_for_each_child {
++        const char *key = NULL;
++        xmlChar *value;
++
++        if (!(value = xmlNodeGetContent(child)))
++            continue;
++
++        if (!strcmp(child->name, "Title"))
++            key = "title";
++        else if (!strcmp(child->name, "Source"))
++            key = "source";
++        else if (!strcmp(child->name, "Copyright"))
++            key = "copyright";
++        else
++            dash_log_unknown_child(s, child);
++
++        if (key) {
++            char key_lang[100];
++            if (lang)
++                sprintf(key_lang, "%s-%s", key, lang);
++            av_dict_set(&s->metadata, lang ? key_lang : key, value, 0);
+         }
+-        ret = open_demux_for_component(s, rep);
+
+-        if (ret)
+-            goto fail;
+-        rep->stream_index = stream_index;
+-        ++stream_index;
++        xmlFree(value);
+     }
+
+-    if (c->n_subtitles)
+-        c->is_init_section_common_subtitle = is_common_init_section_exist(c->subtitles, c->n_subtitles);
++    xml_free(lang);
++    return 0;
++}
++
++static av_cold void dash_reset(AVFormatContext *s)
++{
++    DASHContext *c = s->priv_data;
++
++    /* Gets updated as we parse Periods. */
++    s->duration = AV_NOPTS_VALUE;
++    c->is_live = 0;
++    c->media_presentation_duration = INT64_MIN;
++
++    av_freep_arrayp(&c->reps, dash_free_representation);
++    av_freep_arrayp(&c->ass, dash_free_adaptationset);
++    av_freep_arrayp(&c->periods, dash_free_period);
++
++    av_freep(&c->location);
++
++    xml_freep(&c->id);
++    xml_freep(&c->chain_next_location);
++    xml_freep(&c->fallback_location);
++
++    av_dict_free(&c->protocol_opts);
++}
++
++static av_cold int dash_parse_mpd(AVFormatContext *s,
++                                  DASHURLList *base_urls,
++                                  xmlNodePtr node)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    DASHURLList *urls = dash_ref_urllist(base_urls);
+
+-    for (i = 0; i < c->n_subtitles; i++) {
+-        rep = c->subtitles[i];
+-        if (i > 0 && c->is_init_section_common_subtitle) {
+-            ret = copy_init_section(rep, c->subtitles[0]);
+-            if (ret < 0)
+-                goto fail;
++    /* Nullify periods.
++     * TODO: Maybe they sould be cleaned up after parsing. */
++    for (unsigned i = 0; i < c->nb_periods; ++i) {
++        DASHPeriod *period = c->periods[i];
++        period->start_ts = period->end_ts = 0;
++    }
++
++    {
++        xmlChar *id = xmlGetNoNsProp(node, "id");
++        if (!c->id || !id || strcmp(c->id, id)) {
++            dash_reset(s);
++            c->id = id;
++        } else {
++            xmlFree(id);
+         }
+-        ret = open_demux_for_component(s, rep);
++    }
+
+-        if (ret)
+-            goto fail;
+-        rep->stream_index = stream_index;
+-        ++stream_index;
++    xml_for_each_attr {
++        if (!strcmp(attr->name, "type")) {
++            /* https://livesim.dashif.org/livesim/scte35_2/testpic_2s/Manifest.mpd */
++            if (!strcmp(value, "dynamic"))
++                c->is_live = 1;
++            else if (!strcmp(value, "static"))
++                c->is_live = 0;
++            else
++                dash_log_invalid_attr_value(s, attr, value);
++        } else if (!strcmp(attr->name, "availabilityStartTime"))
++            c->availability_start_time = dash_parse_date(value, s);
++        else if (!strcmp(attr->name, "availabilityEndTime"))
++            c->availability_end_time  = dash_parse_date(value, s);
++        else if (!strcmp(attr->name, "publishTime")) {
++            c->publish_time = dash_parse_date(value, s);
++            /* Take the easy way. */
++            av_dict_set(&s->metadata, "creation_time", value, 0);
++        } else if (!strcmp(attr->name, "minimumUpdatePeriod"))
++            c->min_update_period = dash_parse_duration(value, s);
++        else if (!strcmp(attr->name, "maxSegmentDuration"))
++            c->max_segment_duration = dash_parse_duration(value, s);
++        else if (!strcmp(attr->name, "minBufferTime"))
++            c->min_buffer_time = dash_parse_duration(value, s);
++        else if (!strcmp(attr->name, "timeShiftBufferDepth"))
++            c->time_shift_buffer_depth = dash_parse_duration(value, s);
++        else if (!strcmp(attr->name, "mediaPresentationDuration"))
++            s->duration = c->media_presentation_duration = dash_parse_duration(value, s);
++        else if (strcmp(attr->name, "id") &&
++                 strcmp(attr->name, "profiles") &&
++                 strcmp(attr->name, "schemaLocation"))
++            dash_log_unknown_attr(s, attr, value);
+     }
+
+-    if (!stream_index) {
+-        ret = AVERROR_INVALIDDATA;
+-        goto fail;
++    xml_for_each_child {
++        if (!strcmp(child->name, "ProgramInformation"))
++            ret = dash_parse_programinformation(s, child);
++        else if (!strcmp(child->name, "Location"))
++            ret = dash_parse_location(s, child);
++        else if (!strcmp(child->name, "BaseURL"))
++            ret = dash_parse_baseurl(s, &urls, child);
++        else if (!strcmp(child->name, "Period"))
++            ret = dash_parse_period(s, urls, child);
++        else if (!strcmp(child->name, "UTCTiming"))
++            ret = dash_parse_utctiming(s, child);
++        else if (!strcmp(child->name, "SupplementalProperty") ||
++                 !strcmp(child->name, "EssentialProperty"))
++            ret = dash_parse_property(s, NULL, NULL, child);
++        else
++            dash_log_unknown_child(s, child);
++
++        if (ret < 0)
++            goto out;
+     }
+
+-    /* Create a program */
+-    program = av_new_program(s, 0);
+-    if (!program) {
++out:
++    dash_unref_urllist(urls);
++    return ret;
++}
++
++/**
++ * Remove filename component from an URL.
++ */
++static int ff_make_absolute_head_urla(char **out_url, const char *url)
++{
++    int ret;
++
++    if (0 <= (ret = ff_make_absolute_urla(out_url, url, "./"))) {
++        char *p = *out_url;
++        size_t len = strlen(p);
++
++        if (3 <= len && !memcmp(p + len - 3, "/./", 4))
++            p[len - 2] = '\0';
++    }
++
++    return ret;
++}
++
++static av_cold int dash_parse_root(AVFormatContext *s, xmlNodePtr node)
++{
++    int ret = 0;
++    DASHURLList *urls = NULL;
++    DASHContext *c = s->priv_data;
++
++    if (!node ||
++        strcmp(node->name, "MPD") ||
++        !node->ns ||
++        strcmp(node->ns->href, "urn:mpeg:dash:schema:mpd:2011"))
++    {
++        av_log(s, AV_LOG_ERROR, "Not an MPD\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (!(urls = dash_new_urllist(1))) {
+         ret = AVERROR(ENOMEM);
+-        goto fail;
+-    }
+-
+-    for (i = 0; i < c->n_videos; i++) {
+-        rep = c->videos[i];
+-        av_program_add_stream_index(s, 0, rep->stream_index);
+-        rep->assoc_stream = s->streams[rep->stream_index];
+-        if (rep->bandwidth > 0)
+-            av_dict_set_int(&rep->assoc_stream->metadata, "variant_bitrate", rep->bandwidth, 0);
+-        move_metadata(rep->assoc_stream, "id", &rep->id);
+-    }
+-    for (i = 0; i < c->n_audios; i++) {
+-        rep = c->audios[i];
+-        av_program_add_stream_index(s, 0, rep->stream_index);
+-        rep->assoc_stream = s->streams[rep->stream_index];
+-        if (rep->bandwidth > 0)
+-            av_dict_set_int(&rep->assoc_stream->metadata, "variant_bitrate", rep->bandwidth, 0);
+-        move_metadata(rep->assoc_stream, "id", &rep->id);
+-        move_metadata(rep->assoc_stream, "language", &rep->lang);
+-    }
+-    for (i = 0; i < c->n_subtitles; i++) {
+-        rep = c->subtitles[i];
+-        av_program_add_stream_index(s, 0, rep->stream_index);
+-        rep->assoc_stream = s->streams[rep->stream_index];
+-        move_metadata(rep->assoc_stream, "id", &rep->id);
+-        move_metadata(rep->assoc_stream, "language", &rep->lang);
++        goto out;
+     }
+
+-    return 0;
+-fail:
+-    dash_close(s);
++    if ((ret = ff_make_absolute_head_urla(&urls->elems[0], c->location)) < 0)
++        goto out;
++
++    if ((ret = dash_parse_mpd(s, urls, node)) < 0)
++        goto out;
++
++out:
++    dash_unref_urllist(urls);
+     return ret;
+ }
+
+-static void recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
++static av_cold void dash_libxml_error_handler(void *opaque, const char *fmt, ...)
+ {
+-    int i, j;
+-
+-    for (i = 0; i < n; i++) {
+-        struct representation *pls = p[i];
+-        int needed = !pls->assoc_stream || pls->assoc_stream->discard < AVDISCARD_ALL;
+-
+-        if (needed && !pls->ctx) {
+-            pls->cur_seg_offset = 0;
+-            pls->init_sec_buf_read_offset = 0;
+-            /* Catch up */
+-            for (j = 0; j < n; j++) {
+-                pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
++    AVFormatContext *s = opaque;
++    va_list ap;
++
++    va_start(ap, fmt);
++    av_vlog(s, AV_LOG_ERROR, fmt, ap);
++    va_end(ap);
++}
++
++static av_cold int dash_open_manifest(AVFormatContext *s)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++    xmlParserCtxtPtr xml;
++    AVIOContext *pb;
++    AVDictionary *opts = NULL;
++    uint8_t *location;
++
++    av_dict_set(&opts, "icy", "0", 0);
++    ret = s->io_open(s, &pb, c->location, AVIO_FLAG_READ, &opts);
++    av_dict_free(&opts);
++    if (ret < 0)
++        return ret;
++
++    xmlSetGenericErrorFunc(s, dash_libxml_error_handler);
++
++    /* Why not SAX? DASH-IF may standardize patching that obviously requires us
++     * to maintain DOM. */
++    for (xml = NULL;;) {
++        char buf[1 << 14];
++
++        /* libXML2 needs at least 4 bytes at the beginnig to being able to
++         * initialize its parsing context. */
++        if (0 < (ret = (xml ? avio_read_partial : avio_read)(pb, buf, (xml ? sizeof(buf) : sizeof("BOM"))))) {
++            /* Context is initialized by the first read call. */
++            if (!xml) {
++                if ((xml = xmlCreatePushParserCtxt(NULL, NULL, buf, ret, NULL)))
++                    continue;
++            } else {
++                if (!xmlParseChunk(xml, buf, ret, 0 /* Terminate? */))
++                    continue;
++
++            parse_error:
++                av_log(s, AV_LOG_ERROR, "Failed to parse manifest file\n");
++                ret = AVERROR_INVALIDDATA;
++                goto out;
+             }
+-            reopen_demux_for_component(s, pls);
+-            av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
+-        } else if (!needed && pls->ctx) {
+-            close_demux_for_component(pls);
+-            ff_format_io_close(pls->parent, &pls->input);
+-            av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
++        } else if (ret == AVERROR_EOF) {
++            if (!xmlParseChunk(xml, NULL, 0, 1 /* Terminate? */))
++                break;
++
++            goto parse_error;
+         }
++
++        av_log(s, AV_LOG_ERROR, "Failed to read manifest file\n");
++        goto out;
+     }
++
++    /* For HTTP 3XX redirects standard states that the redirected location
++     * should be used for updates. We are lazy and just check for "location". */
++    if (0 <= av_opt_get(pb, "location", AV_OPT_SEARCH_CHILDREN, &location)) {
++        (void)dash_set_location(s, location);
++        av_free(location);
++    }
++
++    ret = dash_parse_root(s, xmlDocGetRootElement(xml->myDoc));
++
++    if (c->is_live) {
++        int64_t accuracy = c->min_update_period / 20; /* 5% */
++        c->next_update = av_gettime() +
++                         (av_lfg_get(&c->rnd) % accuracy + 1) +
++                         (c->min_update_period - accuracy);
++    } else {
++        c->next_update = 0;
++    }
++
++out:
++    if (xml) {
++        if (xml->myDoc)
++            xmlFreeDoc(xml->myDoc);
++        xmlFreeParserCtxt(xml);
++    }
++
++    /* Reset handlers so passed references to AVFormatContext will not survive. */
++    xmlSetGenericErrorFunc(NULL, NULL);
++
++    ff_format_io_close(s, &pb);
++    return ret;
++}
++
++static av_cold int dash_close(AVFormatContext *s)
++{
++    return dash_reset(s), 0;
++}
++
++static av_cold int dash_save_protocol_options(AVFormatContext *s)
++{
++    static const char OPTIONS[] =
++        "headers\0" "http_proxy\0" "user_agent\0" "cookies\0" "referer\0"
++        "rw_timeout\0" "icy\0";
++
++    DASHContext *c = s->priv_data;
++
++    for (const char *opt = OPTIONS; *opt; opt += strlen(opt) + 1 /* NUL */) {
++        uint8_t *buf;
++
++        if (0 <= av_opt_get(s->pb, opt, AV_OPT_SEARCH_CHILDREN, &buf)) {
++            int ret = av_dict_set(&c->protocol_opts, opt, buf,
++                                  AV_DICT_DONT_OVERWRITE | AV_DICT_DONT_STRDUP_VAL);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
++    return 0;
++}
++
++static av_cold int dash_read_header(AVFormatContext *s)
++{
++    int ret = 0;
++    DASHContext *c = s->priv_data;
++
++    if ((ret = dash_set_location(s, s->url)) < 0)
++        goto out;
++
++    /* Signal that we may create additional streams as time pasts. */
++    s->ctx_flags |= AVFMTCTX_NOHEADER;
++
++    if ((ret = dash_save_protocol_options(s)) < 0)
++        goto out;
++
++    av_lfg_init(&c->rnd, av_get_random_seed());
++
++    if ((ret = dash_open_manifest(s)) < 0)
++        goto out;
++
++out:
++    if (ret < 0)
++        dash_close(s);
++    return ret;
++}
++
++static DASHRepresentation *dash_get_read_next_representation(AVFormatContext *s)
++{
++    DASHContext *c = s->priv_data;
++    DASHRepresentation *best_rep = NULL;
++
++    for (unsigned i = 0; i < c->nb_reps; ++i) {
++        DASHRepresentation *rep = c->reps[i];
++        int needed = 0;
++
++        /* Subdemuxer not opened for this representation, so we are not
++         * interested in receiving segments for this. */
++        if (!rep->ic)
++            continue;
++
++        /* Check if any of the streams is needed. */
++        for (unsigned k = 0; k < rep->nb_streams; ++k) {
++            AVStream *ost = rep->ostreams[k];
++            if ((needed = ost->discard < AVDISCARD_ALL))
++                break;
++        }
++
++        if (!needed)
++            continue;
++
++        /* A toy scheduler. */
++        if (!best_rep || rep->last_pts < best_rep->last_pts)
++            best_rep = rep;
++    }
++
++    return best_rep;
+ }
+
+ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
+ {
++    int ret;
++    DASHRepresentation *rep;
++    AVStream *ist, /* --packet--> */ *ost;
+     DASHContext *c = s->priv_data;
+-    int ret = 0, i;
+-    int64_t mints = 0;
+-    struct representation *cur = NULL;
+-    struct representation *rep = NULL;
+
+-    recheck_discard_flags(s, c->videos, c->n_videos);
+-    recheck_discard_flags(s, c->audios, c->n_audios);
+-    recheck_discard_flags(s, c->subtitles, c->n_subtitles);
+-
+-    for (i = 0; i < c->n_videos; i++) {
+-        rep = c->videos[i];
+-        if (!rep->ctx)
+-            continue;
+-        if (!cur || rep->cur_timestamp < mints) {
+-            cur = rep;
+-            mints = rep->cur_timestamp;
++    if (c->next_update && c->next_update <= av_gettime())
++        if ((ret = dash_open_manifest(s)) < 0) {
++            c->next_update = av_gettime() * (60 * MICROSEC_PER_SEC) /* 1 min */;
++            av_log(s, AV_LOG_ERROR, "Failed to update manifest\n");
+         }
+-    }
+-    for (i = 0; i < c->n_audios; i++) {
+-        rep = c->audios[i];
+-        if (!rep->ctx)
+-            continue;
+-        if (!cur || rep->cur_timestamp < mints) {
+-            cur = rep;
+-            mints = rep->cur_timestamp;
++
++    /* Find a representation where we can read from. */
++    for (;;) {
++        if (!(rep = dash_get_read_next_representation(s))) {
++            /* Load next manifest, if any. */
++            if (c->chain_next_location) {
++                if ((ret = dash_set_location(s, c->chain_next_location)) < 0)
++                    return ret;
++                xml_freep(&c->chain_next_location);
++
++                if ((ret = dash_open_manifest(s)) < 0)
++                    return ret;
++
++                continue;
++            }
++
++            return AVERROR_EOF;
+         }
+-    }
+
+-    for (i = 0; i < c->n_subtitles; i++) {
+-        rep = c->subtitles[i];
+-        if (!rep->ctx)
++        if ((!rep->ic->iformat &&
++             (ret = dash_subdemuxer_open(rep)) < 0) ||
++            (ret = av_read_frame(rep->ic, pkt)) < 0)
++        {
++            av_log(s, AVERROR_EOF != ret ? AV_LOG_ERROR : AV_LOG_DEBUG,
++                   "Failed to read representation '%s': %s\n",
++                   rep->id, av_err2str(ret));
++            dash_subdemuxer_close(rep);
+             continue;
+-        if (!cur || rep->cur_timestamp < mints) {
+-            cur = rep;
+-            mints = rep->cur_timestamp;
+         }
+-    }
+
+-    if (!cur) {
+-        return AVERROR_INVALIDDATA;
++        break;
+     }
+-    while (!ff_check_interrupt(c->interrupt_callback) && !ret) {
+-        ret = av_read_frame(cur->ctx, pkt);
+-        if (ret >= 0) {
+-            /* If we got a packet, return it */
+-            cur->cur_timestamp = av_rescale(pkt->pts, (int64_t)cur->ctx->streams[0]->time_base.num * 90000, cur->ctx->streams[0]->time_base.den);
+-            pkt->stream_index = cur->stream_index;
+-            return 0;
+-        }
+-        if (cur->is_restart_needed) {
+-            cur->cur_seg_offset = 0;
+-            cur->init_sec_buf_read_offset = 0;
+-            ff_format_io_close(cur->parent, &cur->input);
+-            ret = reopen_demux_for_component(s, cur);
+-            cur->is_restart_needed = 0;
+-        }
+-    }
+-    return AVERROR_EOF;
+-}
+
+-static int dash_close(AVFormatContext *s)
+-{
+-    DASHContext *c = s->priv_data;
+-    free_audio_list(c);
+-    free_video_list(c);
+-    free_subtitle_list(c);
+-    av_dict_free(&c->avio_opts);
+-    av_freep(&c->base_url);
++    ist = rep->ic->streams[pkt->stream_index];
++
++    if (/* New stream had been created by the underlying subdemuxer. */
++        rep->nb_streams <= pkt->stream_index ||
++        /* Something changed. */
++        (ist->event_flags & AVSTREAM_EVENT_FLAG_METADATA_UPDATED))
++        if ((ret = dash_subdemuxer_update(rep)) < 0)
++            return ret;
++
++    /* Make packet timestamps comparable to each other. */
++    rep->last_pts = av_rescale_q(pkt->pts + pkt->duration, ist->time_base, AV_TIME_BASE_Q);
++
++    ost = rep->ostreams[pkt->stream_index];
++    if (ost->codecpar->codec_type != ist->codecpar->codec_type ||
++        ost->codecpar->codec_id   != ist->codecpar->codec_id   ||
++        ost->codecpar->codec_tag  != ist->codecpar->codec_tag)
++        if ((ret = dash_subdemuxer_update(rep)) < 0)
++            return ret;
++
++    /* Translate stream_index from inner to outer context. */
++    pkt->stream_index = ost->index;
++
+     return 0;
+ }
+
+-static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags, int dry_run)
+-{
+-    int ret = 0;
+-    int i = 0;
+-    int j = 0;
+-    int64_t duration = 0;
+-
+-    av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
+-           seek_pos_msec, dry_run ? " (dry)" : "");
+-
+-    // single fragment mode
+-    if (pls->n_fragments == 1) {
+-        pls->cur_timestamp = 0;
+-        pls->cur_seg_offset = 0;
+-        if (dry_run)
+-            return 0;
+-        ff_read_frame_flush(pls->ctx);
+-        return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
+-    }
+-
+-    ff_format_io_close(pls->parent, &pls->input);
+-
+-    // find the nearest fragment
+-    if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
+-        int64_t num = pls->first_seq_no;
+-        av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline start n_timelines[%d] "
+-               "last_seq_no[%"PRId64"].\n",
+-               (int)pls->n_timelines, (int64_t)pls->last_seq_no);
+-        for (i = 0; i < pls->n_timelines; i++) {
+-            if (pls->timelines[i]->starttime > 0) {
+-                duration = pls->timelines[i]->starttime;
+-            }
+-            duration += pls->timelines[i]->duration;
+-            if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+-                goto set_seq_num;
+-            }
+-            for (j = 0; j < pls->timelines[i]->repeat; j++) {
+-                duration += pls->timelines[i]->duration;
+-                num++;
+-                if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+-                    goto set_seq_num;
+-                }
+-            }
+-            num++;
+-        }
+-
+-set_seq_num:
+-        pls->cur_seq_no = num > pls->last_seq_no ? pls->last_seq_no : num;
+-        av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline end cur_seq_no[%"PRId64"].\n",
+-               (int64_t)pls->cur_seq_no);
+-    } else if (pls->fragment_duration > 0) {
+-        pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
+-    } else {
+-        av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
+-        pls->cur_seq_no = pls->first_seq_no;
+-    }
+-    pls->cur_timestamp = 0;
+-    pls->cur_seg_offset = 0;
+-    pls->init_sec_buf_read_offset = 0;
+-    ret = dry_run ? 0 : reopen_demux_for_component(s, pls);
+-
+-    return ret;
+-}
+-
+ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
+ {
+-    int ret = 0, i;
++    int ret = 0;
+     DASHContext *c = s->priv_data;
+-    int64_t seek_pos_msec = av_rescale_rnd(timestamp, 1000,
+-                                           s->streams[stream_index]->time_base.den,
+-                                           flags & AVSEEK_FLAG_BACKWARD ?
+-                                           AV_ROUND_DOWN : AV_ROUND_UP);
+-    if ((flags & AVSEEK_FLAG_BYTE) || c->is_live)
++    AVStream *st;
++    int64_t now_ts;
++
++    if (flags & AVSEEK_FLAG_BYTE)
+         return AVERROR(ENOSYS);
+
+-    /* Seek in discarded streams with dry_run=1 to avoid reopening them */
+-    for (i = 0; i < c->n_videos; i++) {
+-        if (!ret)
+-            ret = dash_seek(s, c->videos[i], seek_pos_msec, flags, !c->videos[i]->ctx);
+-    }
+-    for (i = 0; i < c->n_audios; i++) {
+-        if (!ret)
+-            ret = dash_seek(s, c->audios[i], seek_pos_msec, flags, !c->audios[i]->ctx);
+-    }
+-    for (i = 0; i < c->n_subtitles; i++) {
+-        if (!ret)
+-            ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
++    st = s->streams[stream_index];
++    now_ts = av_rescale_q_rnd(timestamp, st->time_base, AV_TIME_BASE_Q,
++                              (flags & AVSEEK_FLAG_BACKWARD)
++                                  ? AV_ROUND_DOWN : AV_ROUND_UP);
++
++    for (unsigned i = 0; i < c->nb_reps; ++i) {
++        DASHRepresentation *rep = c->reps[i];
++
++        if (!rep->ic)
++            continue;
++
++        rep->last_pts = AV_NOPTS_VALUE;
++
++        rep->read_ts = c->start_ts + now_ts;
++
++        if ((ret = av_seek_frame(rep->ic, -1, now_ts, flags)) < 0) {
++            av_log(s, AV_LOG_ERROR, "Failed to seek subdemuxer\n");
++            /* abort(); */
++        }
++
++        dash_subdemuxer_flush(rep);
+     }
+
+     return ret;
+ }
+
+-static int dash_probe(const AVProbeData *p)
++static av_cold int dash_probe(const AVProbeData *p)
+ {
+-    if (!av_stristr(p->buf, "<MPD"))
+-        return 0;
++    if (strstr(p->buf, "<?xml") &&
++        strstr(p->buf, "<MPD"))
++        return AVPROBE_SCORE_MAX;
+
+-    if (av_stristr(p->buf, "dash:profile:isoff-on-demand:2011") ||
+-        av_stristr(p->buf, "dash:profile:isoff-live:2011") ||
+-        av_stristr(p->buf, "dash:profile:isoff-live:2012") ||
+-        av_stristr(p->buf, "dash:profile:isoff-main:2011") ||
+-        av_stristr(p->buf, "3GPP:PSS:profile:DASH1")) {
++    if (p->mime_type && !strncmp(p->mime_type, "application/dash+xml", 20))
+         return AVPROBE_SCORE_MAX;
+-    }
+-    if (av_stristr(p->buf, "dash:profile")) {
+-        return AVPROBE_SCORE_MAX;
+-    }
+
+     return 0;
+ }
+
+ #define OFFSET(x) offsetof(DASHContext, x)
+-#define FLAGS AV_OPT_FLAG_DECODING_PARAM
+ static const AVOption dash_options[] = {
+-    {"allowed_extensions", "List of file extensions that dash is allowed to access",
+-        OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
+-        {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
+-        INT_MIN, INT_MAX, FLAGS},
+-    {NULL}
++    { "connections", "Number of segment requests on the fly (per representation)",
++        OFFSET(nb_connections), AV_OPT_TYPE_INT,
++        { .i64 = 1 }, .min = 1, .max = UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
++    { "protocol_opts", "Specify protocol options for opened segments",
++        OFFSET(protocol_opts), AV_OPT_TYPE_DICT,
++        .flags = AV_OPT_FLAG_DECODING_PARAM },
++    { NULL }
+ };
+
+ static const AVClass dash_class = {
+@@ -2407,5 +3149,6 @@ AVInputFormat ff_dash_demuxer = {
+     .read_packet    = dash_read_packet,
+     .read_close     = dash_close,
+     .read_seek      = dash_read_seek,
++    .extensions     = "mpd",
+     .flags          = AVFMT_NO_BYTE_SEEK,
+ };
+diff --git a/libavformat/internal.h b/libavformat/internal.h
+index 3c6b292..ee547e0 100644
+--- a/libavformat/internal.h
++++ b/libavformat/internal.h
+@@ -33,6 +33,8 @@
+ #define PROBE_BUF_MIN 2048
+ #define PROBE_BUF_MAX (1 << 20)
+
++#define UUID_BUF_SIZE 36
++
+ #ifdef DEBUG
+ #    define hex_dump_debug(class, buf, size) av_hex_dump_log(class, AV_LOG_DEBUG, buf, size)
+ #else
+@@ -379,6 +381,18 @@ do {\
+  */
+ int ff_mkdir_p(const char *path);
+
++char *ff_uuid_to_hex(char *buff, const uint8_t *src, int lowercase);
++
++/**
++ * Parse an UUID string.
++ *
++ * @param data the parsed data is written to this pointer
++ * @param p the string to parse
++ * @return the number of bytes written that is always 16 or negative number on
++ * error
++ */
++int ff_uuid_to_data(uint8_t *data, const char *p);
++
+ char *ff_data_to_hex(char *buf, const uint8_t *src, int size, int lowercase);
+
+ /**
+diff --git a/libavformat/utils.c b/libavformat/utils.c
+index ee947c1..d6b8418 100644
+--- a/libavformat/utils.c
++++ b/libavformat/utils.c
+@@ -4878,6 +4878,53 @@ int ff_mkdir_p(const char *path)
+     return ret;
+ }
+
++char *ff_uuid_to_hex(char *buff, const uint8_t *src, int lowercase)
++{
++    ff_data_to_hex(buff + 0, src + 0, 4, lowercase);
++    buff[8] = '-';
++    ff_data_to_hex(buff + 9, src + 4, 2, lowercase);
++    buff[13] = '-';
++    ff_data_to_hex(buff + 14, src + 6, 2, lowercase);
++    buff[18] = '-';
++    ff_data_to_hex(buff + 19, src + 8, 2, lowercase);
++    buff[23] = '-';
++    ff_data_to_hex(buff + 24, src + 10, 6, lowercase);
++
++    return buff;
++}
++
++int ff_uuid_to_data(uint8_t *data, const char *p)
++{
++    uint8_t len;
++
++    for (len = 0; len < 16; ) {
++        uint8_t h, l;
++
++#define PARSE_XDIGIT(ch, res) \
++        if ('0' <= ch && ch <= '9') \
++            res = ch - '0'; \
++        else if ('A' <= ch && ch <= 'F') \
++            res = ch - 'A' + 10; \
++        else if ('a' <= ch && ch <= 'f') \
++            res = ch - 'a' + 10; \
++        else \
++            return -1;
++
++        PARSE_XDIGIT(p[0], h);
++        PARSE_XDIGIT(p[1], l);
++        p += 2;
++
++#undef PARSE_XDIGIT
++
++        data[len++] = (h << 4) | l;
++
++        if ((4 == len || 6 == len || 8 == len || 10 == len) && *p++ != '-')
++            return -1;
++    }
++
++    return *p == '\0' ? 16 : -1;
++}
++
+ char *ff_data_to_hex(char *buff, const uint8_t *src, int s, int lowercase)
+ {
+     int i;
